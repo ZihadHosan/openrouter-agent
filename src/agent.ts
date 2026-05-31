@@ -45,6 +45,13 @@ function truncateContent(text: string, max: number): string {
   );
 }
 
+const MARKDOWN_FORMAT = `
+FORMATTING:
+- Use markdown for replies (headings, bullet/numbered lists, tables when helpful).
+- Do NOT wrap your entire reply in one code fence (\`\`\`); only fence real code snippets.
+- Write normal prose outside code blocks so it renders as readable chat text.
+- For tables, always include a header row and a separator row (| --- | --- |) before data rows.`;
+
 const ASK_SYSTEM = `You are a helpful coding assistant in VS Code ASK MODE.
 
 You can read ANY file in the workspace automatically (read-only). Use tools to list or read files when the user asks about them.
@@ -68,7 +75,7 @@ STRICT FILE RULES:
 - NEVER say a file exists or does not exist without a successful tool result in this turn.
 - If unsure, call list_files or read_glob first.
 
-Do NOT use write or terminal tools in Ask mode; tell the user to switch to Agent mode for those.`;
+Do NOT use write or terminal tools in Ask mode; tell the user to switch to Agent mode for those.${MARKDOWN_FORMAT}`;
 
 const PLAN_SYSTEM = `You are a planning assistant in VS Code PLAN MODE.
 
@@ -77,7 +84,7 @@ STRICT RULES:
 - Produce a clear step-by-step plan only.
 - Mention likely files to change.
 - Mention risks and commands the user should run manually.
-- Be practical and ordered.`;
+- Be practical and ordered.${MARKDOWN_FORMAT}`;
 
 const AGENT_SYSTEM = `You are a cautious local coding agent in VS Code AGENT MODE.
 
@@ -108,7 +115,7 @@ Rules:
 - Output ONLY one \`\`\`agent-tool JSON block when calling a tool (no XML like <tool_call>).
 - Put any explanation BEFORE the code block, not inside it.
 - After list_files/read_file you will receive JSON results; then continue or answer the user.
-- One tool per message. Wait for results before the next tool.`;
+- One tool per message. Wait for results before the next tool.${MARKDOWN_FORMAT}`;
 
 export function buildPrompt(
   mode: AgentMode,

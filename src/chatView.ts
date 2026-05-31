@@ -41,6 +41,7 @@ export class ChatViewProvider {
   private processing = false;
   private pendingUserMessage: string | null = null;
   private activeAbortController?: AbortController;
+  private streamActiveForUi = false;
   private readonly approvalBridge: ApprovalBridge;
 
   constructor(
@@ -115,10 +116,34 @@ export class ChatViewProvider {
       enableScripts: true,
       localResourceRoots: [this.extensionUri],
     };
-    webview.html = this.getHtml();
+    webview.html = this.getHtml(webview);
     webview.onDidReceiveMessage((msg) => {
       void this.handleWebviewMessage(msg);
     });
+  }
+
+  private getChatFontSize(): number {
+    return vscode.workspace.getConfiguration('openrouterAgent').get<number>('chatFontSize', 0);
+  }
+
+  private getStreamEnabled(): boolean {
+    return vscode.workspace
+      .getConfiguration('openrouterAgent')
+      .get<boolean>('streamResponses', true);
+  }
+
+  refreshWebview(): void {
+    const webview = this.getWebview();
+    if (webview) {
+      webview.html = this.getHtml(webview);
+    }
+  }
+
+  /** Reload webview HTML when extension updates (avoids stale CSS with retainContextWhenHidden). */
+  refreshWebviewIfOpen(): void {
+    if (this.panel) {
+      this.refreshWebview();
+    }
   }
 
   private async openPanelOnRight(): Promise<void> {
@@ -165,8 +190,16 @@ export class ChatViewProvider {
     model?: string;
     id?: string;
     choice?: string;
+    url?: string;
   }): Promise<void> {
     switch (msg.type) {
+      case 'openLink': {
+        const url = String(msg.url ?? '').trim();
+        if (url.startsWith('http://') || url.startsWith('https://')) {
+          await vscode.env.openExternal(vscode.Uri.parse(url));
+        }
+        break;
+      }
       case 'send':
         await this.handleSend(
           String(msg.text ?? ''),
@@ -309,6 +342,7 @@ export class ChatViewProvider {
       processing: this.processing,
       sessions: this.historyStore.listSessions(),
       activeSessionId: this.historyStore.getActiveId(),
+      chatFontSize: this.getChatFontSize(),
       ...this.modelStore.getStateForWebview(),
     });
   }
@@ -345,11 +379,48 @@ export class ChatViewProvider {
     }
     this.activeAbortController?.abort();
     this.approvalBridge.cancelAll();
+    this.cancelStreamUi();
     this.setLoading(true, 'Stopping…');
   }
 
   private async callOpenRouter(conversation: ChatMessage[]): Promise<string> {
     return askOpenRouter(conversation, this.routerOptions());
+  }
+
+  private cancelStreamUi(): void {
+    if (this.streamActiveForUi) {
+      this.post({ type: 'assistantStreamCancel' });
+      this.streamActiveForUi = false;
+    }
+  }
+
+  private async callOpenRouterStreaming(
+    conversation: ChatMessage[],
+    forwardToUi: boolean
+  ): Promise<string> {
+    if (!this.getStreamEnabled() || !forwardToUi) {
+      return this.callOpenRouter(conversation);
+    }
+
+    let streamStarted = false;
+    const result = await askOpenRouter(conversation, {
+      ...this.routerOptions(),
+      stream: true,
+      onChunk: (_delta, accumulated) => {
+        if (!streamStarted) {
+          streamStarted = true;
+          this.streamActiveForUi = true;
+          this.post({ type: 'assistantStreamStart' });
+        }
+        this.post({ type: 'assistantPartial', content: accumulated });
+      },
+    });
+
+    if (!streamStarted) {
+      this.streamActiveForUi = false;
+    }
+
+    return result;
   }
 
   private setLoading(
@@ -439,8 +510,9 @@ export class ChatViewProvider {
           'Step 1: Planning…',
           'Reviewing your request and drafting a plan…'
         );
-        response = await this.callOpenRouter(conversation);
+        response = await this.callOpenRouterStreaming(conversation, true);
         if (this.isAborted()) {
+          this.cancelStreamUi();
           response = STOPPED_MESSAGE;
         } else if (hasToolCallMarkup(response)) {
           const visible = stripToolBlock(response);
@@ -457,7 +529,9 @@ export class ChatViewProvider {
           type: 'assistantMessage',
           content: response,
           details: out.details,
+          finalizeStream: this.streamActiveForUi,
         });
+        this.streamActiveForUi = false;
         this.post({
           type: 'sessions',
           sessions: this.historyStore.listSessions(),
@@ -468,13 +542,19 @@ export class ChatViewProvider {
 
       this.history.push({ role: 'assistant', content: response });
       await this.persistSession();
-      this.post({ type: 'assistantMessage', content: response });
+      this.post({
+        type: 'assistantMessage',
+        content: response,
+        finalizeStream: this.streamActiveForUi,
+      });
+      this.streamActiveForUi = false;
       this.post({
         type: 'sessions',
         sessions: this.historyStore.listSessions(),
         activeSessionId: this.historyStore.getActiveId(),
       });
     } catch (err) {
+      this.cancelStreamUi();
       if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
         this.history.push({ role: 'assistant', content: STOPPED_MESSAGE });
         await this.persistSession();
@@ -491,6 +571,7 @@ export class ChatViewProvider {
     } finally {
       this.processing = false;
       this.activeAbortController = undefined;
+      this.streamActiveForUi = false;
       this.setLoading(false);
     }
   }
@@ -545,9 +626,10 @@ export class ChatViewProvider {
 
       let raw: string;
       try {
-        raw = await this.callOpenRouter(conversation);
+        raw = await this.callOpenRouterStreaming(conversation, true);
       } catch (err) {
         if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
+          this.cancelStreamUi();
           return { content: STOPPED_MESSAGE, details };
         }
         throw err;
@@ -555,6 +637,7 @@ export class ChatViewProvider {
       lastAssistant = raw;
 
       if (this.isAborted()) {
+        this.cancelStreamUi();
         return { content: STOPPED_MESSAGE, details };
       }
 
@@ -563,11 +646,16 @@ export class ChatViewProvider {
         raw.startsWith('**API Error:**') ||
         raw.startsWith('**Network Error:**')
       ) {
+        this.cancelStreamUi();
         return { content: raw, details };
       }
 
       const toolCall = parseToolCall(raw);
       const visible = cleanAssistantVisibleText(raw);
+
+      if (toolCall) {
+        this.cancelStreamUi();
+      }
 
       if (visible && toolCall) {
         this.updateProcess(completedSteps, thinkStep.replace(/…$/, '') + '…', visible);
@@ -832,14 +920,16 @@ export class ChatViewProvider {
 
     let raw: string;
     try {
-      raw = await this.callOpenRouter(conversation);
+      raw = await this.callOpenRouterStreaming(conversation, true);
     } catch (err) {
       if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
+        this.cancelStreamUi();
         return STOPPED_MESSAGE;
       }
       throw err;
     }
     if (this.isAborted()) {
+      this.cancelStreamUi();
       return STOPPED_MESSAGE;
     }
     if (
@@ -847,6 +937,7 @@ export class ChatViewProvider {
       raw.startsWith('**API Error:**') ||
       raw.startsWith('**Network Error:**')
     ) {
+      this.cancelStreamUi();
       return raw;
     }
 
@@ -865,28 +956,44 @@ export class ChatViewProvider {
     );
   }
 
-  private getHtml(): string {
+  private getHtml(webview: vscode.Webview): string {
     const nonce = getNonce();
     const addModelOption = ADD_MODEL_OPTION;
+    const markedUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'marked.min.js')
+    );
+    const chatFontSize = this.getChatFontSize();
+    const fontSizeCss =
+      chatFontSize > 0 ? `${chatFontSize}px` : '14px';
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' ${webview.cspSource};" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OpenRouter Chat</title>
   <style>
+    :root {
+      --chat-font-size: ${fontSizeCss};
+      --chat-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --chat-surface: var(--vscode-panel-background, var(--vscode-editor-background, var(--vscode-sideBar-background)));
+      --chat-user-bg: color-mix(in srgb, var(--vscode-foreground) 10%, var(--chat-surface));
+      --chat-user-border: color-mix(in srgb, var(--vscode-foreground) 18%, var(--chat-surface));
+    }
     * { box-sizing: border-box; }
     html, body {
       margin: 0;
       padding: 0;
       height: 100%;
+      color-scheme: light dark;
     }
+    body.vscode-dark { color-scheme: dark; }
+    body.vscode-light { color-scheme: light; }
     body {
       font-family: var(--vscode-font-family);
       font-size: var(--vscode-font-size);
       color: var(--vscode-foreground);
-      background: var(--vscode-sideBar-background);
+      background: var(--chat-surface);
       display: flex;
       flex-direction: column;
       height: 100%;
@@ -895,11 +1002,11 @@ export class ChatViewProvider {
     .history-bar {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 8px;
       padding: 8px 10px;
       border-bottom: 1px solid var(--vscode-panel-border);
       flex-shrink: 0;
-      background: var(--vscode-sideBar-background);
+      background: var(--chat-surface);
     }
     .history-label {
       font-size: 0.7em;
@@ -909,69 +1016,344 @@ export class ChatViewProvider {
       opacity: 0.65;
       white-space: nowrap;
     }
-    .history-select {
-      flex: 1;
+    .custom-dropdown {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
       min-width: 0;
+    }
+    .custom-dropdown.history-dropdown {
+      flex: 1;
+      width: 100%;
+    }
+    .dropdown-trigger {
       font-family: inherit;
-      font-size: 0.8em;
+      font-size: 0.85em;
+      font-weight: 500;
       color: var(--vscode-foreground);
       background: var(--vscode-input-background);
       border: 1px solid var(--vscode-input-border);
       border-radius: 6px;
-      padding: 5px 8px;
+      padding: 6px 10px;
       cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      width: 100%;
+      min-width: 0;
+      text-align: left;
+      line-height: 1.2;
+    }
+    .dropdown-trigger.pill-trigger {
+      border-radius: 14px;
+      border-color: var(--vscode-widget-border, var(--vscode-panel-border));
+      padding: 6px 10px 6px 12px;
+      min-width: 72px;
+      max-width: 180px;
+      width: auto;
+    }
+    .dropdown-trigger.model-trigger {
+      max-width: 200px;
+    }
+    .dropdown-trigger:hover:not(:disabled) {
+      border-color: var(--vscode-focusBorder);
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+    .dropdown-trigger:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 1px;
+    }
+    .dropdown-trigger:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .dropdown-label {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .dropdown-chevron-wrap {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      opacity: 0.75;
+      transition: opacity 0.15s ease;
+    }
+    .dropdown-chevron {
+      width: 14px;
+      height: 14px;
+      display: block;
+      transition: transform 0.15s ease;
+    }
+    .custom-dropdown.open .dropdown-chevron {
+      transform: rotate(180deg);
+    }
+    .custom-dropdown.open .dropdown-chevron-wrap,
+    .dropdown-trigger:hover:not(:disabled) .dropdown-chevron-wrap {
+      opacity: 1;
+    }
+    .dropdown-menu {
+      position: fixed;
+      z-index: 1000;
+      min-width: 120px;
+      max-height: 280px;
+      overflow-y: auto;
+      background: var(--vscode-dropdown-background, var(--vscode-input-background));
+      color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+      border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+      border-radius: 6px;
+      box-shadow: 0 4px 12px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+      padding: 4px 0;
+    }
+    .dropdown-item {
+      display: block;
+      width: 100%;
+      font-family: inherit;
+      font-size: 0.85em;
+      text-align: left;
+      color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+      background: transparent;
+      border: none;
+      padding: 7px 12px;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .dropdown-item:hover,
+    .dropdown-item:focus-visible {
+      background: var(--vscode-list-hoverBackground, var(--vscode-toolbar-hoverBackground));
+      outline: none;
+    }
+    .dropdown-item.selected {
+      background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
+      color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+    }
+    .dropdown-separator {
+      height: 1px;
+      margin: 4px 8px;
+      background: var(--vscode-panel-border);
     }
     .header-btn {
       font-family: inherit;
-      font-size: 0.8em;
-      background: transparent;
+      font-size: 0.85em;
+      font-weight: 500;
+      background: var(--vscode-input-background);
       color: var(--vscode-foreground);
-      border: none;
-      border-radius: 4px;
-      padding: 4px 8px;
+      border: 1px solid var(--vscode-input-border);
+      border-radius: 6px;
+      padding: 5px 10px;
       cursor: pointer;
-      opacity: 0.8;
+      opacity: 1;
+      line-height: 1.2;
     }
-    .header-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
+    .header-icon-btn {
+      width: 30px;
+      height: 30px;
+      min-width: 30px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      font-weight: 600;
+      line-height: 1;
+    }
+    .header-icon-btn .icon-plus {
+      font-size: 22px;
+      margin-top: -1px;
+    }
+    .header-icon-btn-danger:hover {
+      border-color: var(--vscode-inputValidation-errorBorder);
+      color: var(--vscode-errorForeground);
+    }
+    .header-btn:hover:not(:disabled) {
+      background: var(--vscode-toolbar-hoverBackground);
+      border-color: var(--vscode-focusBorder);
+    }
     button:disabled, select:disabled, textarea:disabled { opacity: 0.45; cursor: not-allowed; }
     #messages {
       flex: 1;
       overflow-y: auto;
-      padding: 8px;
+      padding: 12px;
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 14px;
       min-height: 0;
     }
     .msg {
-      padding: 8px 10px;
-      border-radius: 6px;
-      line-height: 1.45;
+      padding: 0;
+      border-radius: 8px;
       word-break: break-word;
-      white-space: pre-wrap;
-    }
-    .msg.user {
-      background: var(--vscode-input-background);
-      border: 1px solid var(--vscode-input-border);
-      align-self: flex-end;
-      max-width: 95%;
-    }
-    .msg.assistant {
-      background: var(--vscode-editor-background);
-      border: 1px solid var(--vscode-panel-border);
-      align-self: flex-start;
-      max-width: 100%;
+      overflow-wrap: anywhere;
+      white-space: normal;
     }
     .msg.error {
+      padding: 12px 16px;
       background: var(--vscode-inputValidation-errorBackground);
       border: 1px solid var(--vscode-inputValidation-errorBorder);
       color: var(--vscode-errorForeground);
     }
-    .msg.thinking {
-      background: var(--vscode-editor-background);
-      border: 1px dashed var(--vscode-focusBorder);
-      align-self: flex-start;
+    .msg-body {
+      font-family: var(--chat-font-family);
+      font-size: var(--chat-font-size);
+      line-height: 1.65;
+      letter-spacing: 0;
+      font-weight: 400;
+      font-variant-ligatures: common-ligatures;
+      text-rendering: optimizeLegibility;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    .msg-body p,
+    .msg-body li,
+    .msg-body td,
+    .msg-body th,
+    .msg-body blockquote {
+      font-family: inherit;
+      letter-spacing: inherit;
+    }
+    .msg-body > *:first-child { margin-top: 0; }
+    .msg-body > *:last-child { margin-bottom: 0; }
+    .msg-body p { margin: 0 0 0.85em; }
+    .msg-body h1, .msg-body h2, .msg-body h3, .msg-body h4 {
+      margin: 1.1em 0 0.45em;
+      font-weight: 600;
+      line-height: 1.35;
+      letter-spacing: -0.02em;
+      font-family: inherit;
+    }
+    .msg-body h1 { font-size: 1.35em; }
+    .msg-body h2 { font-size: 1.2em; }
+    .msg-body h3 { font-size: 1.08em; }
+    .msg-body h4 { font-size: 1em; }
+    .msg-body ul, .msg-body ol {
+      margin: 0.5em 0 0.75em;
+      padding-left: 1.5em;
+    }
+    .msg-body li { margin: 0.5em 0; }
+    .msg-body li > p { margin: 0.25em 0; }
+    .msg-body hr {
+      margin: 1em 0;
+      border: none;
+      border-top: 1px solid var(--vscode-panel-border);
+    }
+    .msg-body a {
+      color: var(--vscode-textLink-foreground);
+      text-decoration: none;
+    }
+    .msg-body a:hover { text-decoration: underline; }
+    .msg-body blockquote {
+      margin: 0.75em 0;
+      padding: 0.25em 0 0.25em 12px;
+      border-left: 3px solid var(--vscode-focusBorder);
+    }
+    .msg-body table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 0;
+      font-size: 0.95em;
+      display: table;
+      table-layout: auto;
+    }
+    .msg-body .table-wrap {
+      overflow-x: auto;
+      margin: 0.75em 0;
       max-width: 100%;
+    }
+    .msg-body thead { font-weight: 600; }
+    .msg-body tbody tr:nth-child(even) {
+      background: color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
+    }
+    .msg-body th, .msg-body td {
+      border: 1px solid var(--vscode-panel-border);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+      line-height: 1.55;
+    }
+    .msg-body th {
+      background: var(--vscode-input-background);
+      font-weight: 600;
+    }
+    .msg.user {
+      width: 100%;
+      align-self: stretch;
+      max-width: 100%;
+      text-align: left;
+      white-space: pre-wrap;
+      line-height: 1.55;
+      color: var(--vscode-foreground);
+      background: var(--chat-user-bg, var(--vscode-input-background));
+      border: 1px solid var(--chat-user-border, var(--vscode-input-border, var(--vscode-panel-border)));
+      border-radius: 8px;
+      padding: 10px 14px;
+    }
+    .msg.user .msg-body {
+      font-family: var(--chat-font-family);
+      font-size: var(--chat-font-size);
+      line-height: 1.55;
+      background: transparent;
+    }
+    .msg.assistant {
+      color: var(--vscode-foreground);
+      background: none !important;
+      background-color: transparent !important;
+      border: none;
+      border-radius: 0;
+      padding: 6px 0 14px;
+      align-self: stretch;
+      width: 100%;
+      max-width: 100%;
+      box-shadow: none;
+    }
+    .msg.assistant .msg-body {
+      background: none !important;
+      background-color: transparent !important;
+    }
+    .msg.assistant.msg-enter {
+      animation: msgIn 0.25s ease-out;
+    }
+    @keyframes msgIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .msg.assistant.streaming {
+      animation: none;
+    }
+    .stream-cursor {
+      display: inline;
+      color: var(--vscode-focusBorder);
+      animation: cursorBlink 1s step-end infinite;
+      font-weight: 400;
+      margin-left: 1px;
+    }
+    @keyframes cursorBlink {
+      50% { opacity: 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .msg.assistant.msg-enter,
+      .msg.thinking {
+        animation: none !important;
+      }
+      .stream-cursor {
+        animation: none;
+        opacity: 0.75;
+      }
+    }
+    .msg.thinking {
+      color: var(--vscode-descriptionForeground);
+      background: transparent;
+      border: 1px dashed var(--vscode-panel-border);
+      border-radius: 8px;
+      align-self: stretch;
+      width: 100%;
+      max-width: 100%;
+      padding: 10px 14px;
       opacity: 1;
       animation: thinkingIn 0.2s ease;
     }
@@ -987,14 +1369,14 @@ export class ChatViewProvider {
     }
     .thinking-subtitle {
       font-size: 0.72em;
-      opacity: 0.6;
+      color: var(--vscode-descriptionForeground);
       font-weight: normal;
       text-transform: none;
       margin-top: 2px;
     }
     .thinking-thought {
       font-style: italic;
-      opacity: 0.88;
+      color: var(--vscode-descriptionForeground);
       font-size: 0.9em;
       line-height: 1.4;
       padding: 8px 0 2px;
@@ -1005,8 +1387,11 @@ export class ChatViewProvider {
       font-size: 0.75em;
       font-weight: 600;
       text-transform: uppercase;
-      opacity: 0.7;
-      margin-bottom: 4px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 6px;
+    }
+    .msg.error .role {
+      display: block;
     }
     .thinking-body {
       display: flex;
@@ -1048,12 +1433,27 @@ export class ChatViewProvider {
     }
     .tool-details summary {
       cursor: pointer;
-      opacity: 0.85;
+      color: var(--vscode-textLink-foreground);
       user-select: none;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .tool-details summary::-webkit-details-marker { display: none; }
+    .tool-details summary::before {
+      content: '';
+      flex-shrink: 0;
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-top: 6px solid var(--vscode-textLink-foreground);
+      transition: transform 0.15s ease;
+    }
+    .tool-details[open] summary::before {
+      transform: rotate(180deg);
     }
     .tool-details summary:hover {
-      opacity: 1;
-      color: var(--vscode-textLink-foreground);
+      text-decoration: underline;
     }
     .tool-details[open] summary {
       margin-bottom: 8px;
@@ -1092,24 +1492,46 @@ export class ChatViewProvider {
       0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
       40% { transform: scale(1); opacity: 1; }
     }
-    .msg code {
-      font-family: var(--vscode-editor-font-family);
-      background: var(--vscode-textCodeBlock-background);
-      padding: 1px 4px;
-      border-radius: 3px;
-    }
-    .msg pre {
-      overflow-x: auto;
-      background: var(--vscode-textCodeBlock-background);
-      padding: 8px;
+    .msg-body :not(pre) > code {
+      font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+      font-size: 0.88em;
+      color: var(--vscode-textPreformat-foreground, var(--vscode-foreground));
+      background: transparent;
+      border: 1px solid var(--vscode-panel-border);
+      padding: 0.08em 0.35em;
       border-radius: 4px;
-      margin: 6px 0;
+      letter-spacing: normal;
+    }
+    .msg-body pre,
+    .msg pre {
+      font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+      overflow-x: auto;
+      color: var(--vscode-editor-foreground, var(--vscode-foreground));
+      background: var(--vscode-textCodeBlock-background);
+      border: 1px solid var(--vscode-panel-border);
+      padding: 12px 14px;
+      border-radius: 6px;
+      margin: 0.75em 0;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      letter-spacing: normal;
+    }
+    .msg-body pre code {
+      font-family: inherit;
+      padding: 0;
+      border: none;
+      background: transparent;
+      color: inherit;
+      font-size: inherit;
+      white-space: pre-wrap;
     }
     .composer-wrap {
       padding: 8px 10px 10px;
       border-top: 1px solid var(--vscode-panel-border);
       flex-shrink: 0;
-      background: var(--vscode-sideBar-background);
+      background: var(--chat-surface);
+      overflow: visible;
     }
     .composer {
       display: flex;
@@ -1117,7 +1539,7 @@ export class ChatViewProvider {
       border: 1px solid var(--vscode-input-border);
       border-radius: 10px;
       background: var(--vscode-input-background);
-      overflow: hidden;
+      overflow: visible;
     }
     .composer:focus-within {
       border-color: var(--vscode-focusBorder);
@@ -1139,7 +1561,6 @@ export class ChatViewProvider {
     }
     #input::placeholder {
       color: var(--vscode-input-placeholderForeground);
-      opacity: 0.75;
     }
     .composer-footer {
       display: flex;
@@ -1147,11 +1568,12 @@ export class ChatViewProvider {
       justify-content: space-between;
       gap: 8px;
       padding: 6px 8px 8px;
+      overflow: visible;
     }
     .composer-left {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 8px;
       flex-wrap: wrap;
       min-width: 0;
     }
@@ -1161,25 +1583,6 @@ export class ChatViewProvider {
       gap: 8px;
       flex-shrink: 0;
     }
-    .pill-select {
-      font-family: inherit;
-      font-size: 0.8em;
-      color: var(--vscode-foreground);
-      background: var(--vscode-editor-background);
-      border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
-      border-radius: 14px;
-      padding: 4px 26px 4px 10px;
-      max-width: 140px;
-      cursor: pointer;
-      appearance: none;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath fill='%23999' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
-      background-repeat: no-repeat;
-      background-position: right 8px center;
-    }
-    .pill-select:hover:not(:disabled) {
-      border-color: var(--vscode-focusBorder);
-    }
-    #modelSelect { max-width: 160px; }
     .send-spinner {
       width: 18px;
       height: 18px;
@@ -1191,13 +1594,14 @@ export class ChatViewProvider {
     }
     .send-spinner.hidden { display: none; }
     .send-btn {
-      width: 28px;
-      height: 28px;
+      width: 32px;
+      height: 32px;
       border-radius: 50%;
       border: none;
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
-      font-size: 14px;
+      font-size: 16px;
+      font-weight: 700;
       line-height: 1;
       cursor: pointer;
       display: flex;
@@ -1334,9 +1738,9 @@ export class ChatViewProvider {
 <body>
   <div class="history-bar">
     <span class="history-label">History</span>
-    <select id="sessionSelect" class="history-select" title="Switch chat"></select>
-    <button type="button" id="newSessionBtn" class="header-btn" title="New chat">+</button>
-    <button type="button" id="deleteSessionBtn" class="header-btn" title="Delete chat">Del</button>
+    <div id="sessionDropdown" class="custom-dropdown history-dropdown"></div>
+    <button type="button" id="newSessionBtn" class="header-btn header-icon-btn" title="New chat" aria-label="New chat"><span class="icon-plus" aria-hidden="true">+</span></button>
+    <button type="button" id="deleteSessionBtn" class="header-btn header-icon-btn-danger" title="Delete chat" aria-label="Delete chat">Del</button>
     <button type="button" id="clearBtn" class="header-btn" title="Clear messages">Clear</button>
   </div>
   <div id="messages"></div>
@@ -1345,12 +1749,8 @@ export class ChatViewProvider {
       <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — Enter to send, Shift+Enter for new line"></textarea>
       <div class="composer-footer">
         <div class="composer-left">
-          <select id="mode" class="pill-select" title="Mode">
-            <option value="ask">Ask</option>
-            <option value="plan">Plan</option>
-            <option value="agent">Agent</option>
-          </select>
-          <select id="modelSelect" class="pill-select" title="Model"></select>
+          <div id="modeDropdown"></div>
+          <div id="modelDropdown"></div>
         </div>
         <div class="composer-right">
           <div id="sendSpinner" class="send-spinner hidden" title="Working…"></div>
@@ -1359,7 +1759,10 @@ export class ChatViewProvider {
       </div>
     </div>
   </div>
+  <script src="${markedUri}"></script>
   <script nonce="${nonce}">
+    marked.use({ breaks: true, gfm: true });
+
     const vscode = acquireVsCodeApi();
     const AUTO_MODEL = '${AUTO_MODEL_ID}';
     const ADD_MODEL = '${addModelOption}';
@@ -1368,15 +1771,307 @@ export class ChatViewProvider {
     const sendBtn = document.getElementById('sendBtn');
     const sendSpinner = document.getElementById('sendSpinner');
     const clearBtn = document.getElementById('clearBtn');
-    const sessionSelectEl = document.getElementById('sessionSelect');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const deleteSessionBtn = document.getElementById('deleteSessionBtn');
-    const modeEl = document.getElementById('mode');
-    const modelSelectEl = document.getElementById('modelSelect');
 
     let processing = false;
     let thinkingEl = null;
+    let streamingEl = null;
+    let streamingBody = null;
+    let streamText = '';
+    let streamRenderTimer = null;
+    const STREAM_RENDER_MS = 80;
     let approvalPending = false;
+    let lastModelId = AUTO_MODEL;
+
+    var CHEVRON_HTML = '<svg class="dropdown-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    var openDropdown = null;
+
+    function createCustomDropdown(root, settings) {
+      settings = settings || {};
+      root.classList.add('custom-dropdown');
+      if (settings.extraClass) {
+        root.classList.add(settings.extraClass);
+      }
+
+      var trigger = document.createElement('button');
+      trigger.type = 'button';
+      trigger.className = 'dropdown-trigger ' + (settings.triggerClass || '');
+      trigger.title = settings.title || '';
+      trigger.setAttribute('aria-haspopup', 'listbox');
+      trigger.setAttribute('aria-expanded', 'false');
+
+      var labelEl = document.createElement('span');
+      labelEl.className = 'dropdown-label';
+      var chevronWrap = document.createElement('span');
+      chevronWrap.className = 'dropdown-chevron-wrap';
+      chevronWrap.innerHTML = CHEVRON_HTML;
+      trigger.appendChild(labelEl);
+      trigger.appendChild(chevronWrap);
+
+      var menu = document.createElement('div');
+      menu.className = 'dropdown-menu';
+      menu.hidden = true;
+      menu.setAttribute('role', 'listbox');
+
+      root.appendChild(trigger);
+      root.appendChild(menu);
+
+      var options = [];
+      var value = settings.value || '';
+      var disabled = false;
+
+      function findLabel(val) {
+        for (var i = 0; i < options.length; i++) {
+          if (!options[i].separator && options[i].value === val) {
+            return options[i].label;
+          }
+        }
+        return val;
+      }
+
+      function updateTrigger() {
+        labelEl.textContent = findLabel(value) || value || settings.placeholder || 'Select';
+      }
+
+      function renderMenu() {
+        menu.innerHTML = '';
+        options.forEach(function(opt) {
+          if (opt.separator) {
+            var sep = document.createElement('div');
+            sep.className = 'dropdown-separator';
+            sep.setAttribute('role', 'separator');
+            menu.appendChild(sep);
+            return;
+          }
+          var item = document.createElement('button');
+          item.type = 'button';
+          item.className = 'dropdown-item';
+          item.setAttribute('role', 'option');
+          item.dataset.value = opt.value;
+          item.textContent = opt.label;
+          if (opt.title) {
+            item.title = opt.title;
+          }
+          if (opt.value === value) {
+            item.classList.add('selected');
+            item.setAttribute('aria-selected', 'true');
+          } else {
+            item.setAttribute('aria-selected', 'false');
+          }
+          item.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (settings.onBeforeSelect && settings.onBeforeSelect(opt, value) === false) {
+              close();
+              return;
+            }
+            var prev = value;
+            value = opt.value;
+            updateTrigger();
+            close();
+            if (settings.onChange) {
+              settings.onChange(value, prev);
+            }
+          });
+          menu.appendChild(item);
+        });
+      }
+
+      function clearMenuPosition() {
+        menu.style.top = '';
+        menu.style.bottom = '';
+        menu.style.left = '';
+        menu.style.width = '';
+        menu.style.minWidth = '';
+        menu.style.maxHeight = '';
+      }
+
+      function positionMenu() {
+        var rect = trigger.getBoundingClientRect();
+        var gap = 4;
+        var maxMenuHeight = 280;
+        var minOpen = 80;
+        var spaceBelow = window.innerHeight - rect.bottom - gap - 8;
+        var spaceAbove = rect.top - gap - 8;
+        var contentHeight = menu.scrollHeight || 0;
+        var openBelow = spaceBelow >= minOpen || spaceBelow >= spaceAbove;
+
+        root.classList.remove('open-above');
+        menu.style.position = 'fixed';
+        menu.style.left = rect.left + 'px';
+        menu.style.width = rect.width + 'px';
+        menu.style.minWidth = rect.width + 'px';
+
+        if (openBelow) {
+          menu.style.top = (rect.bottom + gap) + 'px';
+          menu.style.bottom = 'auto';
+          menu.style.maxHeight = Math.min(maxMenuHeight, Math.max(48, spaceBelow)) + 'px';
+        } else {
+          root.classList.add('open-above');
+          var maxH = Math.min(maxMenuHeight, Math.max(48, spaceAbove));
+          menu.style.maxHeight = maxH + 'px';
+          menu.style.bottom = (window.innerHeight - rect.top + gap) + 'px';
+          menu.style.top = 'auto';
+        }
+      }
+
+      function open() {
+        if (disabled) {
+          return;
+        }
+        if (openDropdown && openDropdown !== api) {
+          openDropdown.close();
+        }
+        openDropdown = api;
+        root.classList.add('open');
+        trigger.setAttribute('aria-expanded', 'true');
+        menu.hidden = false;
+        if (menu.parentNode !== document.body) {
+          document.body.appendChild(menu);
+        }
+        renderMenu();
+        requestAnimationFrame(function() {
+          positionMenu();
+        });
+      }
+
+      function close() {
+        root.classList.remove('open');
+        root.classList.remove('open-above');
+        trigger.setAttribute('aria-expanded', 'false');
+        menu.hidden = true;
+        clearMenuPosition();
+        if (menu.parentNode === document.body) {
+          root.appendChild(menu);
+        }
+        if (openDropdown === api) {
+          openDropdown = null;
+        }
+      }
+
+      trigger.addEventListener('click', function(e) {
+        e.stopPropagation();
+        if (disabled) {
+          return;
+        }
+        if (root.classList.contains('open')) {
+          close();
+        } else {
+          open();
+        }
+      });
+
+      trigger.addEventListener('keydown', function(e) {
+        if (disabled) {
+          return;
+        }
+        if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          if (!root.classList.contains('open')) {
+            open();
+          }
+        } else if (e.key === 'Escape') {
+          close();
+        }
+      });
+
+      var api = {
+        setOptions: function(opts) {
+          options = opts || [];
+          updateTrigger();
+          if (root.classList.contains('open')) {
+            renderMenu();
+            requestAnimationFrame(function() {
+              positionMenu();
+            });
+          }
+        },
+        setValue: function(v) {
+          value = v;
+          updateTrigger();
+          if (root.classList.contains('open')) {
+            renderMenu();
+          }
+        },
+        getValue: function() {
+          return value;
+        },
+        setDisabled: function(d) {
+          disabled = !!d;
+          trigger.disabled = disabled;
+          if (disabled) {
+            close();
+          }
+        },
+        close: close
+      };
+
+      if (settings.options) {
+        api.setOptions(settings.options);
+      }
+      if (settings.value) {
+        api.setValue(settings.value);
+      } else {
+        updateTrigger();
+      }
+
+      return api;
+    }
+
+    document.addEventListener('click', function() {
+      if (openDropdown) {
+        openDropdown.close();
+      }
+    });
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && openDropdown) {
+        openDropdown.close();
+      }
+    });
+
+    const sessionDropdown = createCustomDropdown(document.getElementById('sessionDropdown'), {
+      triggerClass: 'history-trigger',
+      title: 'Switch chat',
+      placeholder: 'No chats',
+      onChange: function(sessionId) {
+        if (processing) {
+          return;
+        }
+        vscode.postMessage({ type: 'switchSession', sessionId: sessionId });
+      }
+    });
+
+    const modeDropdown = createCustomDropdown(document.getElementById('modeDropdown'), {
+      triggerClass: 'pill-trigger',
+      title: 'Mode',
+      value: 'ask',
+      options: [
+        { value: 'ask', label: 'Ask' },
+        { value: 'plan', label: 'Plan' },
+        { value: 'agent', label: 'Agent' }
+      ],
+      onChange: function(mode) {
+        vscode.postMessage({ type: 'setMode', mode: mode });
+      }
+    });
+
+    const modelDropdown = createCustomDropdown(document.getElementById('modelDropdown'), {
+      triggerClass: 'pill-trigger model-trigger',
+      title: 'Model',
+      value: AUTO_MODEL,
+      onBeforeSelect: function(opt) {
+        if (opt.value === ADD_MODEL) {
+          vscode.postMessage({ type: 'promptAddModel' });
+          return false;
+        }
+        return true;
+      },
+      onChange: function(modelId) {
+        lastModelId = modelId;
+        vscode.postMessage({ type: 'setModel', modelId: modelId });
+      }
+    });
 
     function escapeHtml(text) {
       const d = document.createElement('div');
@@ -1384,14 +2079,108 @@ export class ChatViewProvider {
       return d.innerHTML;
     }
 
-    function formatContent(text) {
-      let html = escapeHtml(text);
-      html = html.replace(/\`\`\`([\\w]*)\\n([\\s\\S]*?)\`\`\`/g, (_, lang, code) => {
-        return '<pre><code>' + code + '</code></pre>';
+    function isPipeRow(line) {
+      return /^\\|.+\\|$/.test(line.trim());
+    }
+
+    function isSeparatorRow(line) {
+      return /^\\|[\\s\\-:|]+\\|$/.test(line.trim());
+    }
+
+    function pipeColCount(line) {
+      return line.trim().split('|').filter(function(part) {
+        return part.trim() !== '';
+      }).length;
+    }
+
+    function makeHeaderRow(cols) {
+      var labels = ['Item', 'Status', 'Details', 'Notes', 'Info'];
+      var cells = [];
+      for (var c = 0; c < cols; c++) {
+        cells.push(labels[c] || ('Col ' + (c + 1)));
+      }
+      return '| ' + cells.join(' | ') + ' |';
+    }
+
+    function makeSepRow(cols) {
+      var cells = [];
+      for (var c = 0; c < cols; c++) {
+        cells.push('---');
+      }
+      return '| ' + cells.join(' | ') + ' |';
+    }
+
+    function normalizePipeTables(text) {
+      var lines = text.split('\\n');
+      var out = [];
+      var i = 0;
+      while (i < lines.length) {
+        if (!isPipeRow(lines[i])) {
+          out.push(lines[i]);
+          i++;
+          continue;
+        }
+        var block = [];
+        while (i < lines.length && isPipeRow(lines[i])) {
+          block.push(lines[i]);
+          i++;
+        }
+        var hasSeparator = block.some(isSeparatorRow);
+        if (!hasSeparator && block.length > 0) {
+          var cols = pipeColCount(block[0]);
+          if (cols > 0) {
+            out.push(makeHeaderRow(cols));
+            out.push(makeSepRow(cols));
+          }
+        }
+        block.forEach(function(row) {
+          out.push(row);
+        });
+      }
+      return out.join('\\n');
+    }
+
+    function unwrapFullMessageFence(text) {
+      var trimmed = text.trim();
+      var match = trimmed.match(/^\\x60\\x60\\x60(?:[\\w-]*)?\\s*\\n([\\s\\S]*?)\\n\\x60\\x60\\x60\\s*$/);
+      if (match) {
+        return match[1].trim();
+      }
+      match = trimmed.match(/^\\x60\\x60\\x60(?:[\\w-]*)?\\s*\\n([\\s\\S]*?)\\x60\\x60\\x60\\s*$/);
+      if (match) {
+        return match[1].trim();
+      }
+      return text;
+    }
+
+    function formatContent(text, role) {
+      if (!text) return '';
+      if (role === 'user' || role === 'error') {
+        return escapeHtml(text);
+      }
+      try {
+        return marked.parse(normalizePipeTables(unwrapFullMessageFence(text)));
+      } catch {
+        return escapeHtml(text);
+      }
+    }
+
+    function applyChatFontSize(px) {
+      const size = Number(px) > 0 ? px + 'px' : '';
+      if (size) {
+        document.documentElement.style.setProperty('--chat-font-size', size);
+      } else {
+        document.documentElement.style.setProperty('--chat-font-size', '14px');
+      }
+    }
+
+    function bindMessageLinks(body) {
+      body.addEventListener('click', (e) => {
+        const anchor = e.target.closest('a');
+        if (!anchor || !anchor.href) return;
+        e.preventDefault();
+        vscode.postMessage({ type: 'openLink', url: anchor.href });
       });
-      html = html.replace(/\`([^\`]+)\`/g, '<code>$1</code>');
-      html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
-      return html;
     }
 
     function appendToolDetails(parent, details) {
@@ -1473,7 +2262,7 @@ export class ChatViewProvider {
       div.appendChild(pre);
       div.appendChild(footer);
       messagesEl.appendChild(div);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollMessageIntoView(div, 'start');
 
       terminalBlocks.set(runId, { div, pre, footer, status });
       return div;
@@ -1486,7 +2275,7 @@ export class ChatViewProvider {
       }
       const out = [stdout, stderr].filter(Boolean).join(stderr && stdout ? '\\n' : '');
       block.pre.textContent = out || '(no output yet)';
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollMessageIntoView(block.div, 'end');
     }
 
     function finishTerminalBlock(runId, stdout, stderr, exitCode, timedOut, success, background, running) {
@@ -1515,7 +2304,7 @@ export class ChatViewProvider {
         terminalBlocks.delete(runId);
       }
 
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollMessageIntoView(block.div, 'end');
     }
 
     function appendTerminalBlock(command, cwd, shell, stdout, stderr, exitCode, timedOut) {
@@ -1578,23 +2367,168 @@ export class ChatViewProvider {
       div.appendChild(detail);
       div.appendChild(actions);
       messagesEl.appendChild(div);
+      scrollMessageIntoView(div, 'start');
+    }
+
+    function wrapTables(body) {
+      body.querySelectorAll('table').forEach((table) => {
+        if (table.parentElement && table.parentElement.classList.contains('table-wrap')) {
+          return;
+        }
+        const wrap = document.createElement('div');
+        wrap.className = 'table-wrap';
+        table.parentNode.insertBefore(wrap, table);
+        wrap.appendChild(table);
+      });
+    }
+
+    function scrollMessageIntoView(el, block) {
+      if (!el) return;
+      const align = block || 'start';
+      requestAnimationFrame(function() {
+        requestAnimationFrame(function() {
+          el.scrollIntoView({ block: align, behavior: 'auto' });
+        });
+      });
+    }
+
+    function prefersReducedMotion() {
+      return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+
+    function removeStreamUi(removeNode) {
+      if (streamRenderTimer) {
+        clearTimeout(streamRenderTimer);
+        streamRenderTimer = null;
+      }
+      if (removeNode && streamingEl) {
+        streamingEl.remove();
+      }
+      streamingEl = null;
+      streamingBody = null;
+      streamText = '';
+    }
+
+    function scrollStreamIntoView() {
+      if (!streamingEl) {
+        return;
+      }
       messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function morphThinkingToStream() {
+      removeStreamUi(false);
+      var div = thinkingEl || document.getElementById('thinking-indicator');
+      if (div) {
+        thinkingEl = null;
+        div.classList.remove('thinking', 'thinking-fade-out');
+        div.classList.add('assistant', 'streaming');
+        div.removeAttribute('id');
+        div.innerHTML = '';
+        streamingBody = document.createElement('div');
+        streamingBody.className = 'msg-body';
+        var cursor = document.createElement('span');
+        cursor.className = 'stream-cursor';
+        cursor.textContent = '▍';
+        streamingBody.appendChild(cursor);
+        div.appendChild(streamingBody);
+        streamingEl = div;
+      } else {
+        removeThinking(true);
+        streamingEl = document.createElement('div');
+        streamingEl.className = 'msg assistant streaming';
+        streamingBody = document.createElement('div');
+        streamingBody.className = 'msg-body';
+        var cursorEl = document.createElement('span');
+        cursorEl.className = 'stream-cursor';
+        cursorEl.textContent = '▍';
+        streamingBody.appendChild(cursorEl);
+        streamingEl.appendChild(streamingBody);
+        messagesEl.appendChild(streamingEl);
+      }
+      streamText = '';
+      scrollMessageIntoView(streamingEl, 'start');
+    }
+
+    function flushStreamRender() {
+      if (!streamingBody) {
+        return;
+      }
+      streamRenderTimer = null;
+      streamingBody.innerHTML = formatContent(streamText, 'assistant');
+      var cursor = document.createElement('span');
+      cursor.className = 'stream-cursor';
+      cursor.textContent = '▍';
+      streamingBody.appendChild(cursor);
+      bindMessageLinks(streamingBody);
+      wrapTables(streamingBody);
+      scrollStreamIntoView();
+    }
+
+    function scheduleStreamRender() {
+      if (streamRenderTimer) {
+        return;
+      }
+      var delay = prefersReducedMotion() ? 0 : STREAM_RENDER_MS;
+      streamRenderTimer = setTimeout(flushStreamRender, delay);
+    }
+
+    function updateAssistantPartial(content) {
+      if (!streamingEl) {
+        morphThinkingToStream();
+      } else {
+        removeThinking(true);
+      }
+      streamText = content || '';
+      scheduleStreamRender();
+    }
+
+    function cancelAssistantStream() {
+      removeStreamUi(true);
+    }
+
+    function finishAssistantStream(content, details) {
+      removeThinking(true);
+      if (streamRenderTimer) {
+        clearTimeout(streamRenderTimer);
+        streamRenderTimer = null;
+      }
+      if (streamingEl && streamingBody) {
+        streamingEl.classList.remove('streaming');
+        streamingEl.classList.add('msg-enter');
+        streamingBody.innerHTML = formatContent(content, 'assistant');
+        bindMessageLinks(streamingBody);
+        wrapTables(streamingBody);
+        appendToolDetails(streamingEl, details);
+        scrollMessageIntoView(streamingEl, 'start');
+        streamingEl = null;
+        streamingBody = null;
+        streamText = '';
+        return;
+      }
+      appendMessage('assistant', content, 'msg-enter', details);
     }
 
     function appendMessage(role, content, extraClass, details) {
       const div = document.createElement('div');
       div.className = 'msg ' + role + (extraClass ? ' ' + extraClass : '');
-      const label = role === 'user' ? 'You' : role === 'error' ? 'Error' : 'Assistant';
       const body = document.createElement('div');
       body.className = 'msg-body';
-      body.innerHTML = formatContent(content);
-      div.innerHTML = '<div class="role">' + label + '</div>';
+      body.innerHTML = formatContent(content, role);
+      bindMessageLinks(body);
+      wrapTables(body);
+      if (role === 'error') {
+        const label = document.createElement('div');
+        label.className = 'role';
+        label.textContent = 'Error';
+        div.appendChild(label);
+      }
       div.appendChild(body);
       if (role === 'assistant') {
         appendToolDetails(div, details);
       }
       messagesEl.appendChild(div);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollMessageIntoView(div, 'start');
       return div;
     }
 
@@ -1626,12 +2560,11 @@ export class ChatViewProvider {
       const current = (process && process.current) || label || 'Thinking…';
       const thought = process && process.thought ? process.thought : '';
       thinkingEl.innerHTML =
-        '<div class="role">Thinking<div class="thinking-subtitle">Hidden when the answer is ready</div></div>' +
         '<div class="thinking-body">' +
         renderProcessHtml(completed, current, thought) +
         '</div>';
       messagesEl.appendChild(thinkingEl);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollMessageIntoView(thinkingEl, 'end');
     }
 
     function updateThinking(label, process) {
@@ -1646,7 +2579,7 @@ export class ChatViewProvider {
       if (body) {
         body.innerHTML = renderProcessHtml(completed, current, thought);
       }
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollMessageIntoView(thinkingEl, 'end');
     }
 
     function removeThinking(instant) {
@@ -1673,11 +2606,7 @@ export class ChatViewProvider {
     }
 
     function getSelectedModelId() {
-      const v = modelSelectEl.value;
-      if (v === ADD_MODEL) {
-        return modelSelectEl.dataset.lastValue || AUTO_MODEL;
-      }
-      return v;
+      return modelDropdown.getValue() || lastModelId || AUTO_MODEL;
     }
 
     function formatSessionTime(ts) {
@@ -1691,51 +2620,38 @@ export class ChatViewProvider {
     }
 
     function populateSessions(sessions, activeId) {
-      sessionSelectEl.innerHTML = '';
-      (sessions || []).forEach((s) => {
-        const opt = document.createElement('option');
-        opt.value = s.id;
-        const count = s.messageCount ? ' (' + s.messageCount + ')' : '';
-        opt.textContent = s.title + ' · ' + formatSessionTime(s.updatedAt) + count;
-        opt.title = s.title;
-        sessionSelectEl.appendChild(opt);
+      var opts = (sessions || []).map(function(s) {
+        var count = s.messageCount ? ' (' + s.messageCount + ')' : '';
+        return {
+          value: s.id,
+          label: s.title + ' · ' + formatSessionTime(s.updatedAt) + count,
+          title: s.title
+        };
       });
+      sessionDropdown.setOptions(opts);
       if (activeId) {
-        sessionSelectEl.value = activeId;
+        sessionDropdown.setValue(activeId);
+      } else if (opts.length) {
+        sessionDropdown.setValue(opts[0].value);
       }
     }
 
     function populateModels(state) {
       const models = state.availableModels || [];
       const selected = state.selectedModelId || AUTO_MODEL;
-      modelSelectEl.innerHTML = '';
-      const autoOpt = document.createElement('option');
-      autoOpt.value = AUTO_MODEL;
-      autoOpt.textContent = 'Auto';
-      modelSelectEl.appendChild(autoOpt);
-      models.forEach((m) => {
-        const opt = document.createElement('option');
-        opt.value = m;
-        opt.textContent = shortModelLabel(m);
-        opt.title = m;
-        modelSelectEl.appendChild(opt);
+      var opts = [{ value: AUTO_MODEL, label: 'Auto' }];
+      models.forEach(function(m) {
+        opts.push({ value: m, label: shortModelLabel(m), title: m });
       });
-      const sep = document.createElement('option');
-      sep.disabled = true;
-      sep.textContent = '──────────';
-      modelSelectEl.appendChild(sep);
-      const addOpt = document.createElement('option');
-      addOpt.value = ADD_MODEL;
-      addOpt.textContent = 'Add model…';
-      modelSelectEl.appendChild(addOpt);
-      if (selected === AUTO_MODEL || models.includes(selected)) {
-        modelSelectEl.value = selected;
-      } else if (models.length) {
-        modelSelectEl.value = models[0];
-      } else {
-        modelSelectEl.value = AUTO_MODEL;
+      opts.push({ separator: true });
+      opts.push({ value: ADD_MODEL, label: 'Add model…' });
+      var val = selected;
+      if (selected !== AUTO_MODEL && models.indexOf(selected) === -1) {
+        val = models.length ? models[0] : AUTO_MODEL;
       }
-      modelSelectEl.dataset.lastValue = modelSelectEl.value;
+      modelDropdown.setOptions(opts);
+      modelDropdown.setValue(val);
+      lastModelId = val;
     }
 
     function updateSendButton() {
@@ -1755,15 +2671,18 @@ export class ChatViewProvider {
     function setLoading(loading, label, process) {
       processing = loading;
       inputEl.disabled = loading || approvalPending;
-      modeEl.disabled = loading || approvalPending;
-      modelSelectEl.disabled = loading || approvalPending;
-      sessionSelectEl.disabled = loading || approvalPending;
+      modeDropdown.setDisabled(loading || approvalPending);
+      modelDropdown.setDisabled(loading || approvalPending);
+      sessionDropdown.setDisabled(loading || approvalPending);
       newSessionBtn.disabled = loading || approvalPending;
       deleteSessionBtn.disabled = loading || approvalPending;
       clearBtn.disabled = loading || approvalPending;
       updateSendButton();
       if (loading) {
         sendSpinner.classList.remove('hidden');
+        if (streamingEl) {
+          return;
+        }
         if (thinkingEl) {
           updateThinking(label, process);
         } else {
@@ -1771,6 +2690,7 @@ export class ChatViewProvider {
         }
       } else {
         sendSpinner.classList.add('hidden');
+        removeThinking(false);
       }
     }
 
@@ -1781,7 +2701,7 @@ export class ChatViewProvider {
       vscode.postMessage({
         type: 'send',
         text,
-        mode: modeEl.value,
+        mode: modeDropdown.getValue(),
         modelId
       });
       inputEl.value = '';
@@ -1809,26 +2729,9 @@ export class ChatViewProvider {
       if (processing) return;
       vscode.postMessage({ type: 'newSession' });
     });
-    sessionSelectEl.addEventListener('change', () => {
-      if (processing) return;
-      vscode.postMessage({ type: 'switchSession', sessionId: sessionSelectEl.value });
-    });
     deleteSessionBtn.addEventListener('click', () => {
       if (processing) return;
-      vscode.postMessage({ type: 'deleteSession', sessionId: sessionSelectEl.value });
-    });
-    modeEl.addEventListener('change', () => {
-      vscode.postMessage({ type: 'setMode', mode: modeEl.value });
-    });
-    modelSelectEl.addEventListener('change', () => {
-      if (modelSelectEl.value === ADD_MODEL) {
-        const prev = modelSelectEl.dataset.lastValue || AUTO_MODEL;
-        modelSelectEl.value = prev;
-        vscode.postMessage({ type: 'promptAddModel' });
-        return;
-      }
-      modelSelectEl.dataset.lastValue = modelSelectEl.value;
-      vscode.postMessage({ type: 'setModel', modelId: modelSelectEl.value });
+      vscode.postMessage({ type: 'deleteSession', sessionId: sessionDropdown.getValue() });
     });
     inputEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -1845,7 +2748,8 @@ export class ChatViewProvider {
         case 'init':
           messagesEl.innerHTML = '';
           removeThinking(true);
-          modeEl.value = msg.mode || 'ask';
+          applyChatFontSize(msg.chatFontSize || 0);
+          modeDropdown.setValue(msg.mode || 'ask');
           populateModels(msg);
           populateSessions(msg.sessions, msg.activeSessionId);
           (msg.history || []).forEach((m) => appendMessage(m.role, m.content, '', m.details));
@@ -1860,21 +2764,33 @@ export class ChatViewProvider {
         case 'modelAdded':
           populateModels(msg);
           if (msg.modelId) {
-            modelSelectEl.value = msg.modelId;
-            modelSelectEl.dataset.lastValue = msg.modelId;
+            modelDropdown.setValue(msg.modelId);
+            lastModelId = msg.modelId;
           }
           break;
         case 'userMessage':
           appendMessage('user', msg.content);
-          messagesEl.scrollTop = messagesEl.scrollHeight;
           break;
-        case 'assistantMessage':
-          removeThinking(false);
-          setTimeout(() => {
-            appendMessage('assistant', msg.content, '', msg.details);
-          }, 280);
+        case 'assistantStreamStart':
+          morphThinkingToStream();
           break;
         case 'assistantPartial':
+          updateAssistantPartial(msg.content);
+          break;
+        case 'assistantStreamCancel':
+          cancelAssistantStream();
+          break;
+        case 'assistantMessage':
+          if (msg.finalizeStream && streamingEl) {
+            removeThinking(false);
+            finishAssistantStream(msg.content, msg.details);
+          } else {
+            removeStreamUi(true);
+            removeThinking(false);
+            setTimeout(function() {
+              appendMessage('assistant', msg.content, 'msg-enter', msg.details);
+            }, 280);
+          }
           break;
         case 'error':
           removeThinking(false);
@@ -1892,6 +2808,7 @@ export class ChatViewProvider {
         case 'cleared':
           messagesEl.innerHTML = '';
           removeThinking();
+          removeStreamUi(true);
           break;
         case 'toolApproval':
           showApprovalCard(msg);
@@ -1900,8 +2817,8 @@ export class ChatViewProvider {
           approvalPending = !!msg.pending;
           inputEl.disabled = processing || approvalPending;
           if (!processing) {
-            modeEl.disabled = approvalPending;
-            modelSelectEl.disabled = approvalPending;
+            modeDropdown.setDisabled(approvalPending);
+            modelDropdown.setDisabled(approvalPending);
           }
           updateSendButton();
           break;

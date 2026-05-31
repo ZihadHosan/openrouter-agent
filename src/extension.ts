@@ -23,6 +23,8 @@ export function activate(context: vscode.ExtensionContext): void {
 
   void apiKeyStore.migrateFromSettingsIfNeeded();
 
+  chatProvider.refreshWebviewIfOpen();
+
   const chatStatusBar = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,
     200
@@ -158,6 +160,14 @@ export function activate(context: vscode.ExtensionContext): void {
         eb.replace(editor.selection, proposed);
       });
       void vscode.window.showInformationMessage('OpenRouter Agent: Selection updated.');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('openrouterAgent.chatFontSize')) {
+        chatProvider.refreshWebview();
+      }
     })
   );
 }

@@ -1,8 +1,8 @@
 {
   "name": "openrouter-agent",
   "displayName": "OpenRouter Agent",
- "description": "Lightweight AI assistant using OpenRouter with Ask, Plan, and Agent modes",
-  "version": "0.4.4",
+  "description": "Lightweight AI assistant using OpenRouter with Ask, Plan, and Agent modes",
+  "version": "0.9.1",
   "publisher": "local",
   "engines": {
     "vscode": "^1.85.0"
@@ -83,7 +83,12 @@
         },
         "openrouterAgent.agentPermissions": {
           "type": "string",
-          "enum": ["ask", "readOnly", "workspace", "full"],
+          "enum": [
+            "ask",
+            "readOnly",
+            "workspace",
+            "full"
+          ],
           "enumDescriptions": [
             "Ask before file writes and terminal commands.",
             "Auto-approve list/read files only.",
@@ -102,10 +107,26 @@
         },
         "openrouterAgent.shellFallbacks": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "markdownDescription": "Extra shell paths tried after the default chain. Example: `C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe`",
           "order": 4
+        },
+        "openrouterAgent.chatFontSize": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 24,
+          "markdownDescription": "Chat message font size in pixels. **0** uses 14px (readable default for chat prose).",
+          "order": 5
+        },
+        "openrouterAgent.streamResponses": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Stream assistant replies token-by-token in chat. Disable for slower machines or if you prefer instant full messages.",
+          "order": 6
         }
       }
     }
@@ -121,5 +142,8 @@
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "marked": "^18.0.4"
   }
 }

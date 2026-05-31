@@ -11,6 +11,8 @@ export interface AskOpenRouterOptions {
   modelStore?: ModelStore;
   apiKeyStore: ApiKeyStore;
   signal?: AbortSignal;
+  stream?: boolean;
+  onChunk?: (delta: string, accumulated: string) => void;
 }
 
 export class AskOpenRouterAbortedError extends Error {
@@ -29,6 +31,7 @@ export function isAskOpenRouterAborted(err: unknown): boolean {
 
 interface OpenRouterChoice {
   message?: { content?: string };
+  delta?: { content?: string };
 }
 
 interface OpenRouterResponse {
@@ -64,6 +67,80 @@ function buildRequestBody(
   return { models: fallbacks.slice(0, 3), messages };
 }
 
+function formatApiError(parsed: OpenRouterResponse & { message?: string }, status: number, statusText: string): string {
+  const detail =
+    parsed.error?.message ??
+    parsed.message ??
+    `HTTP ${status} ${statusText}`;
+  return `**API Error:** ${detail}`;
+}
+
+async function readSseStream(
+  response: Response,
+  signal: AbortSignal | undefined,
+  onChunk: (delta: string, accumulated: string) => void
+): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error('No response body');
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let accumulated = '';
+
+  while (true) {
+    if (signal?.aborted) {
+      throw new AskOpenRouterAbortedError();
+    }
+
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) {
+        continue;
+      }
+
+      const data = trimmed.slice(5).trim();
+      if (!data || data === '[DONE]') {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(data) as OpenRouterResponse;
+        const delta =
+          parsed.choices?.[0]?.delta?.content ??
+          parsed.choices?.[0]?.message?.content;
+        if (typeof delta === 'string' && delta.length > 0) {
+          accumulated += delta;
+          onChunk(delta, accumulated);
+        }
+      } catch {
+        /* skip malformed SSE chunk */
+      }
+    }
+  }
+
+  return accumulated;
+}
+
+async function readJsonCompletion(response: Response): Promise<string> {
+  const parsed = (await response.json()) as OpenRouterResponse & { message?: string };
+  const content = parsed.choices?.[0]?.message?.content;
+  if (content === undefined || content === null) {
+    return '**Error:** OpenRouter returned an empty response.';
+  }
+  return content;
+}
+
 export async function askOpenRouter(
   messages: ChatMessage[],
   options: AskOpenRouterOptions
@@ -81,6 +158,8 @@ export async function askOpenRouter(
     return '**Error:** No models configured. Add a model in chat or set `openrouterAgent.models` in Settings.';
   }
 
+  const useStream = !!(options.stream && options.onChunk);
+
   try {
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -90,7 +169,7 @@ export async function askOpenRouter(
         'HTTP-Referer': 'https://github.com/openrouter-agent',
         'X-Title': 'OpenRouter Agent VS Code Extension',
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(useStream ? { ...body, stream: true } : body),
       signal: options.signal,
     });
 
@@ -98,25 +177,41 @@ export async function askOpenRouter(
       throw new AskOpenRouterAbortedError();
     }
 
-    const parsed = (await response.json()) as OpenRouterResponse & { message?: string };
-
-    if (options.signal?.aborted) {
-      throw new AskOpenRouterAbortedError();
-    }
+    const contentType = response.headers.get('content-type') ?? '';
 
     if (!response.ok) {
-      const detail =
-        parsed.error?.message ??
-        parsed.message ??
-        `HTTP ${response.status} ${response.statusText}`;
-      return `**API Error:** ${detail}`;
+      let parsed: OpenRouterResponse & { message?: string } = {};
+      try {
+        parsed = (await response.json()) as OpenRouterResponse & { message?: string };
+      } catch {
+        /* body may not be JSON */
+      }
+      return formatApiError(parsed, response.status, response.statusText);
     }
 
-    const content = parsed.choices?.[0]?.message?.content;
-    if (content === undefined || content === null) {
+    if (useStream && contentType.includes('text/event-stream')) {
+      const streamed = await readSseStream(response, options.signal, options.onChunk!);
+      if (options.signal?.aborted) {
+        throw new AskOpenRouterAbortedError();
+      }
+      if (streamed.length > 0) {
+        return streamed;
+      }
       return '**Error:** OpenRouter returned an empty response.';
     }
 
+    if (useStream) {
+      const text = await readJsonCompletion(response);
+      if (text && !text.startsWith('**Error:**') && options.onChunk) {
+        options.onChunk(text, text);
+      }
+      return text;
+    }
+
+    const content = await readJsonCompletion(response);
+    if (options.signal?.aborted) {
+      throw new AskOpenRouterAbortedError();
+    }
     return content;
   } catch (err) {
     if (options.signal?.aborted || isAskOpenRouterAborted(err)) {
