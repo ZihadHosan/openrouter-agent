@@ -1,0 +1,10 @@
+Fix Stop button for slow models and terminal commands
+
+- Added AbortSignal support to terminalRunner.ts to track and kill child processes
+- Updated runProcess() to handle abort events and clean up process tracking
+- Modified executeRunCommand() and handleToolCall() to accept and forward AbortSignal
+- Updated runOneTool() to pass abort signal from ChatViewProvider
+- handleStop() now calls stopAllRunningProcesses() to terminate all running commands
+- Added stopAllRunningProcesses() utility to cancel all tracked processes
+
+Version: 1.6.2 → 1.7.0 (minor, 4 source files modified)
