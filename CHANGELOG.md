@@ -7,6 +7,27 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **README** rewritten for Marketplace users (install, get started, features); build/VSIX/publish moved to **[docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)**.
+
+---
+
+## [1.0.0] — 2026-05-30
+
+### Added
+- **Marketplace-ready metadata** — publisher, repository, license, keywords, gallery banner, 128×128 icon.
+- **[LICENSE](./LICENSE)** (MIT) and **[PRIVACY.md](./PRIVACY.md)** (OpenRouter data handling).
+- README section for publishing to VS Code Marketplace.
+
+### Changed
+- `publisher` set to **`ZihadHosan`** (register this id at [Visual Studio Marketplace](https://marketplace.visualstudio.com/manage) before `vsce publish`).
+- Category includes **Machine Learning**.
+- `.vscodeignore` tightened so dev files are not bundled in the VSIX.
+
+---
+
 ## [0.9.3] — 2026-05-30
 
 ### Added

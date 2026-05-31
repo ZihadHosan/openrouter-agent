@@ -1,8 +1,16 @@
 .vscode/**
 .vscode-test/**
+.cursor/**
+.githooks/**
+scripts/**
+.version-state.json
 src/**
 tsconfig.json
 **/*.ts
 **/*.map
 .gitignore
 node_modules/**
+*.vsix
+media/icon.svg
+media/icon-light.svg
+media/icon-dark.svg

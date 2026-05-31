@@ -1,188 +1,106 @@
 # OpenRouter Agent
 
-A lightweight **VS Code / Cursor** extension that adds an AI chat panel with **Ask**, **Plan**, and **Agent** modes, powered by the [OpenRouter](https://openrouter.ai/) API.
+AI chat for **VS Code** and **Cursor** — **Ask**, **Plan**, and **Agent** modes powered by [OpenRouter](https://openrouter.ai/). Use any OpenRouter model (free or paid). Chat opens in a **panel on the right**, beside your code.
 
-Use any OpenRouter model (free or paid). Chat opens in a **panel on the right** of your editor — similar to Cursor’s AI sidebar.
-
----
-
-## What you need
-
-| Requirement | Details |
-|-------------|---------|
-| **Editor** | [VS Code](https://code.visualstudio.com/) 1.85+ or [Cursor](https://cursor.com/) |
-| **Node.js** | 18+ (only for building from source) |
-| **OpenRouter account** | Free API key at [openrouter.ai/keys](https://openrouter.ai/keys) |
-| **Workspace** | A project folder open on disk (required for **Ask** and **Agent** file tools) |
+[![VS Marketplace](https://img.shields.io/visual-studio-marketplace/v/ZihadHosan.openrouter-agent?label=VS%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=ZihadHosan.openrouter-agent)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
 
-## Quick start
+## Install
 
-Use this repo to **build and install** the extension in your normal VS Code or Cursor window (not the F5 debug host).
+**From the Marketplace (recommended)**
 
-> **`npm run compile` is not enough** to use the extension in your everyday editor. You must **`npx @vscode/vsce package`** to create a `.vsix`, then **Install from VSIX…** and reload.
+1. Open **Extensions** (`Ctrl+Shift+X` / `Cmd+Shift+X`)
+2. Search **OpenRouter Agent**
+3. Click **Install**, then **Reload** if prompted
 
-### 1. Clone and install dependencies
-
-```bash
-git clone https://github.com/ZihadHosan/openrouter-agent.git
-cd openrouter-agent
-npm install
-```
-
-Open the **`openrouter-agent`** folder in VS Code or Cursor (`File → Open Folder`).
-
-### 2. Build the `.vsix` installer (required)
-
-From the project root in a terminal:
+Or from the terminal:
 
 ```bash
-npx @vscode/vsce package
+code --install-extension ZihadHosan.openrouter-agent
 ```
 
-This command:
+**Manual install** (`.vsix` or building from source) → see [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md).
 
-1. Compiles TypeScript automatically (`precompile` → `npm run compile`)
-2. Bundles the extension into a file like **`openrouter-agent-0.9.3.vsix`** in the project root (version matches `package.json`)
+---
 
-You do **not** need to install `@vscode/vsce` globally — `npx` runs it for this command.
+## Get started
 
-If you already ran `npm run compile` separately, that is fine; **`npx @vscode/vsce package` is still required** to produce the installable `.vsix`.
+### 1. Open a workspace
 
-### 3. Install the extension
+Open a project folder (**File → Open Folder**). **Ask** and **Agent** modes need a workspace on disk to read files.
 
-Use the **same VS Code or Cursor window** where you want OpenRouter Chat every day (you can have any project folder open, or open one after install).
+### 2. Set your API key
 
-#### Option A — Command Palette (recommended)
-
-1. Press **`Ctrl+Shift+P`** (Mac: **`Cmd+Shift+P`**) to open the **Command Palette**.
-2. Type **`install from vsix`** (or **`Extensions: Install from VSIX`**).
-3. Select **`Extensions: Install from VSIX...`**
-4. In the file picker, go to your `openrouter-agent` folder and select the file from step 2, e.g. **`openrouter-agent-0.9.3.vsix`**.
-5. Wait for the “Extension installed” message.
-
-#### Option B — Extensions sidebar
-
-1. Press **`Ctrl+Shift+X`** (Mac: **`Cmd+Shift+X`**) to open **Extensions**.
-2. Click the **`⋯`** (three dots) menu at the top of the Extensions panel.
-3. Click **Install from VSIX…**
-4. Select the `.vsix` file from step 2.
-
-#### Reload the window (required)
-
-The extension loads fully only after a reload. Use **either** method:
-
-**Reload method 1 — prompt after install**
-
-- If the editor shows **“Reload Required”** or **“Reload”**, click **Reload**.
-
-**Reload method 2 — Command Palette**
-
-1. Press **`Ctrl+Shift+P`** (Mac: **`Cmd+Shift+P`**).
-2. Type **`reload window`** (or **`Developer: Reload Window`**).
-3. Select **`Developer: Reload Window`**.
-
-After reload, open **Extensions** (`Ctrl+Shift+X`) and confirm **OpenRouter Agent** appears under **Installed**.
-
-### 4. Open a workspace
-
-Open a project folder (`File → Open Folder`). **Ask** and **Agent** modes need a workspace on disk to read files.
-
-### 5. Add your API key
-
-The key is stored securely in the editor (not in plain-text settings).
+Your key is stored in the editor’s **secret storage** (not in plain settings).
 
 1. **Ctrl+Shift+P** (Mac: **Cmd+Shift+P**)
 2. Run **`OpenRouter: Set API Key`**
-3. Paste your key from [openrouter.ai/keys](https://openrouter.ai/keys)
+3. Paste a key from [openrouter.ai/keys](https://openrouter.ai/keys)
 
-To remove it: **`OpenRouter: Clear API Key`**.
+Remove it anytime: **`OpenRouter: Clear API Key`**.
 
-### 6. Open chat
+### 3. Open chat
 
 | Method | Action |
 |--------|--------|
-| **Easiest** | Click **OpenRouter** in the **bottom status bar** (right side) |
+| **Status bar** | Click **OpenRouter** (bottom-right) |
 | **Shortcut** | **Ctrl+Alt+L** (Mac: **Cmd+Alt+L**) |
 | **Command Palette** | **`OpenRouter: Open Chat`** |
-| **Editor toolbar** | Chat bubble icon on the top-right of an open file |
+| **Editor toolbar** | Chat icon on an open file |
 
-The chat panel opens **beside your code** on the right.
+### 4. Send a message
 
-### 7. Send a message
-
-- Type in the box at the bottom.
-- Press **Enter** to send.
-- **Shift+Enter** for a new line.
-- While the model is thinking, the send button (**↑**) becomes **Stop (■)** — click to cancel.
-
-Pick a **mode** and **model** from the pills below the input.
-
-### Updating after you change the code
-
-When you pull changes or edit the extension, rebuild the installer and reinstall:
-
-```bash
-npx @vscode/vsce package
-```
-
-Then install again:
-
-1. **`Ctrl+Shift+P`** → type **`install from vsix`** → **`Extensions: Install from VSIX...`** → pick the new `.vsix`.
-2. Reload: click **Reload** if prompted, **or** **`Ctrl+Shift+P`** → **`Developer: Reload Window`**.
-
-You do not need to uninstall the old version first.
-
-See **[CHANGELOG.md](./CHANGELOG.md)** for version history.
+- **Enter** to send · **Shift+Enter** for a new line
+- Pick **Ask**, **Plan**, or **Agent** and a **model** below the input
+- While the model works, **↑** becomes **Stop (■)**
 
 ---
 
-### For extension developers only (F5 debug)
+## Features
 
-Use this when you are **actively changing** `src/` and want hot reload in an isolated window:
-
-1. Open this repo in VS Code/Cursor.
-2. Run **`npm run compile`** (or **`npm run watch`**).
-3. Press **F5** (or **Run → Start Debugging** → **Run OpenRouter Agent**).
-4. A second **Extension Development Host** window opens — test the chat there.
-
-End users should prefer the **VSIX install** steps above so the extension runs in their everyday editor.
+- **Ask** — Q&A and read-only file exploration in your workspace
+- **Plan** — Step-by-step plans without running tools
+- **Agent** — Read, write (with approval), and terminal commands (with approval)
+- **Streaming replies** — Token-by-token responses (disable in settings)
+- **Chat history** — Sessions saved automatically; switch or start new chats
+- **Any OpenRouter model** — Built-in list + **Add model…** in chat
+- **Smart scroll** — Follows new text unless you scroll up to read earlier content
 
 ---
 
-## Modes explained
+## Modes
 
-### Ask — questions & read-only help
+### Ask
 
-Best for: explaining code, reading files, quick answers.
+Best for explaining code, reading files, and quick answers.
 
-- Can **read** and **list** files in your workspace automatically.
-- Cannot write files or run terminal commands.
-- Example: *“What does `CHANGELOG.md` say?”* or *“Read all markdown files in this project.”*
+- Reads and lists workspace files automatically
+- Does not write files or run terminal commands
 
-### Plan — step-by-step plans only
+### Plan
 
-Best for: design before you code.
+Best for designing before you code.
 
-- Produces ordered steps, files to touch, risks, and commands **you** should run.
-- Does **not** edit files or run tools.
+- Ordered steps, files to touch, risks, and commands **you** run manually
+- Does not edit files or call tools
 
-### Agent — read, write, and run commands
+### Agent
 
-Best for: multi-step tasks with your approval.
+Best for multi-step work with your approval.
 
 | Action | Behavior |
 |--------|----------|
 | Read / list files | Runs automatically |
-| Write files | Shows an **approval card** in chat |
-| Run terminal commands | Shows an **approval card**; output appears in chat |
+| Write files | Approval card in chat |
+| Terminal commands | Approval card; output in chat |
 
-Set global permission defaults: **`OpenRouter: Agent Permissions`** (Command Palette).
+Default permission level: **`OpenRouter: Agent Permissions`** (Command Palette).
 
 ---
 
-## Settings (optional)
+## Settings
 
 Open **Settings** (`Ctrl+,`) and search **`openrouterAgent`**.
 
@@ -190,86 +108,34 @@ Open **Settings** (`Ctrl+,`) and search **`openrouterAgent`**.
 |---------|---------|
 | **`openrouterAgent.models`** | Up to 3 fallback models when **Auto** is selected |
 | **`openrouterAgent.agentPermissions`** | `ask` · `readOnly` · `workspace` · `full` |
-| **`openrouterAgent.shell`** | Custom shell for in-chat commands (Windows example: `C:\Windows\System32\cmd.exe`) |
-| **`openrouterAgent.shellFallbacks`** | Extra shell paths if the default chain fails |
-| **`openrouterAgent.chatFontSize`** | Chat text size in px (`0` = 14px default) |
-| **`openrouterAgent.streamResponses`** | Stream replies token-by-token (`true` by default) |
+| **`openrouterAgent.shell`** | Custom shell for in-chat commands |
+| **`openrouterAgent.shellFallbacks`** | Extra shell paths if defaults fail |
+| **`openrouterAgent.chatFontSize`** | Chat text size in px (`0` = 14px) |
+| **`openrouterAgent.streamResponses`** | Stream replies token-by-token (default: on) |
 
-Default **Auto** fallbacks:
-
-1. `z-ai/glm-4.5-air:free`
-2. `openrouter/owl-alpha`
-3. `deepseek/deepseek-v4-flash`
-
-Add more models from the **model dropdown** in chat → **Add model…**
+Default **Auto** models: `z-ai/glm-4.5-air:free`, `openrouter/owl-alpha`, `deepseek/deepseek-v4-flash`.
 
 ---
 
-## All commands
+## Commands
 
-| Command | What it does |
-|---------|----------------|
-| **OpenRouter: Open Chat** | Open/focus chat |
-| **OpenRouter: Set API Key** | Save API key (secure) |
+| Command | Description |
+|---------|-------------|
+| **OpenRouter: Open Chat** | Open or focus chat |
+| **OpenRouter: Set API Key** | Save API key |
 | **OpenRouter: Clear API Key** | Remove API key |
-| **OpenRouter: Agent Permissions** | Default approve/ask behavior |
-| **OpenRouter: Ask About Current File** | Ask mode + current file context |
-| **OpenRouter: Explain Selection** | Explain highlighted code |
+| **OpenRouter: Agent Permissions** | Default tool approval behavior |
+| **OpenRouter: Ask About Current File** | Ask mode with open file context |
+| **OpenRouter: Explain Selection** | Explain selected code |
 | **OpenRouter: Fix Selection** | Suggest a fix for selection |
 
 ---
 
 ## Chat history
 
-- Conversations **save automatically**.
-- **History** dropdown at the top — switch chats.
-- **+** new chat · **Del** delete · **Clear** clear current chat only.
-
----
-
-## Development
-
-### Project layout
-
-```
-├── src/              Extension source (TypeScript)
-├── media/            Icons
-├── scripts/          Build helpers (auto version bump)
-├── dist/             Compiled output (generated)
-├── CHANGELOG.md      Version history
-├── package.json
-└── tsconfig.json
-```
-
-### Commands
-
-```bash
-npm install                    # once
-npm run compile                # build TypeScript only (dev / F5)
-npm run watch                  # rebuild on save
-npx @vscode/vsce package       # create installable .vsix (required for normal use)
-```
-
-### Debug
-
-1. **Terminal → Run Build Task** (or `npm run compile`).
-2. **Run and Debug** → **Run OpenRouter Agent** → **F5**.
-3. Test in the Extension Development Host window.
-
-If you see *“You don't have an extension for debugging JSON”*, select **Run OpenRouter Agent**, not JSON debug.
-
-### Package and install
-
-Same as [Quick start §2](#2-build-the-vsix-installer-required):
-
-```bash
-npx @vscode/vsce package
-```
-
-Install the generated `.vsix`:
-
-1. **`Ctrl+Shift+P`** → **`Extensions: Install from VSIX...`** → select the file.
-2. **`Ctrl+Shift+P`** → **`Developer: Reload Window`** (or click **Reload** when prompted).
+- Conversations **save automatically**
+- **History** dropdown — switch sessions
+- **+** new chat · **Del** delete session · **Clear** clear current chat only
 
 ---
 
@@ -277,25 +143,40 @@ Install the generated `.vsix`:
 
 | Problem | Fix |
 |---------|-----|
-| Chat doesn’t open | Reload window; confirm **OpenRouter Agent** is enabled under Extensions |
-| **Ctrl+Alt+L** does nothing | Use Command Palette → **OpenRouter: Open Chat** |
+| Chat doesn’t open | Reload window; confirm extension is **Enabled** |
+| **Ctrl+Alt+L** does nothing | Command Palette → **OpenRouter: Open Chat** |
 | “No API key” | **OpenRouter: Set API Key** |
-| Agent can’t run commands | Set **`openrouterAgent.shell`** or open the correct workspace folder |
-| Wrong file answers in Ask | Open the folder that contains the files; start a **new chat** |
-| Old version in UI | Rebuild (`npm run compile`), repackage (`npx @vscode/vsce package`), reinstall VSIX, reload |
-| Changes not visible after edit | Close and reopen the chat panel, or reload window; for dev use **F5** host |
+| Agent can’t run commands | Open a workspace folder; set **`openrouterAgent.shell`** if needed |
+| Wrong files in Ask mode | Open the correct folder; start a **new chat** |
+| Extension feels outdated | Extensions → check for updates, or reload window |
 
 ---
 
-## Safety
+## Privacy & safety
 
-- API keys use the editor’s **secret storage**.
-- File access is limited to the **open workspace**.
-- Writes and commands require approval (unless you change permissions).
-- Destructive commands show an extra **danger** warning.
+- API keys stay in **VS Code secret storage**
+- File access is limited to the **open workspace**
+- Writes and commands require approval (unless you change permissions)
+- Destructive commands show an extra warning
+
+Full disclosure: **[PRIVACY.md](./PRIVACY.md)** — what is sent to OpenRouter and what stays local.
+
+---
+
+## Development
+
+Building from source, VSIX packaging, F5 debug, and Marketplace publishing:
+
+**[docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)**
+
+---
+
+## Changelog
+
+**[CHANGELOG.md](./CHANGELOG.md)**
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).

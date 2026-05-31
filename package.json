@@ -1,15 +1,39 @@
 {
   "name": "openrouter-agent",
   "displayName": "OpenRouter Agent",
-  "description": "Lightweight AI assistant using OpenRouter with Ask, Plan, and Agent modes",
-  "version": "0.9.3",
-  "publisher": "local",
+  "description": "Lightweight AI chat for VS Code and Cursor — Ask, Plan, and Agent modes powered by OpenRouter.",
+  "version": "1.0.0",
+  "publisher": "ZihadHosan",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZihadHosan/openrouter-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ZihadHosan/openrouter-agent/issues"
+  },
+  "homepage": "https://github.com/ZihadHosan/openrouter-agent#readme",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
+    "Machine Learning",
     "Other"
   ],
+  "keywords": [
+    "openrouter",
+    "ai",
+    "chat",
+    "agent",
+    "llm",
+    "assistant",
+    "copilot"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
   "activationEvents": [
     "onStartupFinished",
     "onCommand:openrouterAgent.openChat"
