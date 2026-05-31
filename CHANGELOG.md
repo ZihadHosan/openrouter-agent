@@ -31,12 +31,6 @@ _Nothing yet._
 
 ---
 
-## [Unreleased]
-
-_Nothing yet._
-
----
-
 ## [1.0.0] — 2026-05-30
 
 ### Added
