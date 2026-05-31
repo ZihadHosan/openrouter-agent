@@ -7,17 +7,27 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 
 ---
 
-## [1.3.0] — 2026-05-30
+## [1.4.1] — 2026-05-30
 
-### Changed
-- **Auto model selection** — picks one model from your available list per request (by Ask / Plan / Agent mode and message), instead of a fixed fallback chain or “free models” label.
-- Removed misleading **Auto = free models** UI copy; settings and README describe Auto behavior accurately.
+### Added
+- **Chat attachments** — paperclip button and drag-and-drop for images (PNG/JPEG/WebP/GIF), PDFs, and text/code files.
+- Attachments sent to OpenRouter as multimodal message content; **Auto** prefers vision-capable models when images/PDFs are attached.
+- Attachment previews in chat history; files stored locally under extension global storage (not in settings JSON).
+- Settings: `openrouterAgent.maxAttachments`, `maxImageSizeMb`, `maxPdfSizeMb`.
 
 ---
 
 ## [Unreleased]
 
 _Nothing yet._
+
+---
+
+## [1.3.0] — 2026-05-30
+
+### Changed
+- **Auto model selection** — picks one model from your available list per request (by Ask / Plan / Agent mode and message), instead of a fixed fallback chain or “free models” label.
+- Removed misleading **Auto = free models** UI copy; settings and README describe Auto behavior accurately.
 
 ---
 

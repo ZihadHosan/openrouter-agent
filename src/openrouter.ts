@@ -4,18 +4,37 @@ import { pickAutoModel } from './autoModel';
 import { ApiKeyStore } from './apiKeyStore';
 import { AUTO_MODEL_ID, ModelStore } from './models';
 
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string; detail?: string } }
+  | { type: 'file'; file: { filename: string; file_data: string } };
+
+export type MessageContent = string | ContentPart[];
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: MessageContent;
 }
 
 export interface AskOpenRouterOptions {
   modelStore?: ModelStore;
   apiKeyStore: ApiKeyStore;
   mode?: AgentMode;
+  hasVisionAttachments?: boolean;
   signal?: AbortSignal;
   stream?: boolean;
   onChunk?: (delta: string, accumulated: string) => void;
+}
+
+/** Extract plain text from message content for heuristics and history display. */
+export function messageContentToText(content: MessageContent): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  return content
+    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+    .map((p) => p.text)
+    .join('\n');
 }
 
 export class AskOpenRouterAbortedError extends Error {
@@ -55,7 +74,8 @@ export function getModels(): string[] {
 function buildRequestBody(
   messages: ChatMessage[],
   modelStore?: ModelStore,
-  mode: AgentMode = 'ask'
+  mode: AgentMode = 'ask',
+  hasVisionAttachments = false
 ): Record<string, unknown> {
   const selectedId = modelStore?.getSelectedModelId() ?? AUTO_MODEL_ID;
 
@@ -68,12 +88,13 @@ function buildRequestBody(
     return { messages };
   }
 
-  const lastUser =
-    [...messages].reverse().find((m) => m.role === 'user')?.content ?? '';
+  const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
+  const lastUser = lastUserMsg ? messageContentToText(lastUserMsg.content) : '';
   const picked = pickAutoModel(available, {
     mode,
     userMessage: lastUser,
     conversationLength: messages.length,
+    hasVisionAttachments: hasVisionAttachments ?? false,
   });
 
   if (!picked) {
@@ -168,7 +189,12 @@ export async function askOpenRouter(
     );
   }
 
-  const body = buildRequestBody(messages, options.modelStore, options.mode ?? 'ask');
+  const body = buildRequestBody(
+    messages,
+    options.modelStore,
+    options.mode ?? 'ask',
+    options.hasVisionAttachments ?? false
+  );
   if (!('model' in body) && !('models' in body)) {
     return '**Error:** No models configured. Add a model in chat or set `openrouterAgent.models` in Settings.';
   }

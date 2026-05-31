@@ -17,6 +17,7 @@ When you send a chat message, the extension may transmit to **OpenRouter**:
 | Data | When |
 |------|------|
 | Your **prompt** and **conversation history** (current session) | Every chat request |
+| **Images, PDFs, and attached files** | When you attach files in chat (sent as base64 to vision/file-capable models) |
 | **Workspace file contents** | When the model uses read/list tools, or you include file/selection context |
 | **Terminal command output** | When Agent mode runs an approved command |
 | Your **OpenRouter API key** | In the `Authorization` header on each API request |
@@ -29,6 +30,7 @@ The extension also sends standard OpenRouter HTTP headers (`HTTP-Referer`, `X-Ti
 |------|---------|
 | OpenRouter **API key** | VS Code Secret Storage (encrypted by the editor) |
 | **Chat history** (sessions) | Extension global state on your machine |
+| **Attachment files** (images, PDFs) | Extension global storage on your machine (per session) |
 | **Agent permission choices** | Workspace/user settings |
 
 The extension does **not** include analytics, crash reporting, or third-party telemetry.

@@ -32,7 +32,7 @@ code --install-extension ZihadHosan.openrouter-agent
 1. **Install** from Extensions → search **OpenRouter Agent** → **Install** → **Reload** if prompted.
 2. **Set API key** — **Ctrl+Shift+P** → **`OpenRouter: Set API Key`** → paste a key from [openrouter.ai/keys](https://openrouter.ai/keys).
 3. **Open chat** — click **OpenRouter** in the status bar, or press **Ctrl+Alt+L** (Mac: **Cmd+Alt+L**), or run **`OpenRouter: Open Chat`** from the Command Palette.
-4. **Send a message** — pick **Ask**, **Plan**, or **Agent**; use **Auto** to let the extension choose the best model from your list, or pick / add a specific model.
+4. **Send a message** — pick **Ask**, **Plan**, or **Agent**; attach **images, PDFs, or files** with the paperclip; use **Auto** or pick a model.
 
 ### 1. Open a workspace
 
@@ -60,6 +60,7 @@ Remove it anytime: **`OpenRouter: Clear API Key`**.
 ### 4. Send a message
 
 - **Enter** to send · **Shift+Enter** for a new line
+- **Paperclip** or drag-and-drop to attach images, PDFs, or text/code files
 - Pick **Ask**, **Plan**, or **Agent** and a **model** below the input
 - While the model works, **↑** becomes **Stop (■)**
 
@@ -73,6 +74,7 @@ Remove it anytime: **`OpenRouter: Clear API Key`**.
 - **Streaming replies** — Token-by-token responses (disable in settings)
 - **Chat history** — Sessions saved automatically; switch or start new chats
 - **Any OpenRouter model** — Built-in list + **Add model…** in chat
+- **Attachments** — Images, PDFs, and workspace files in chat (vision-aware **Auto** model pick)
 - **Smart scroll** — Follows new text unless you scroll up to read earlier content
 
 ---
@@ -119,6 +121,9 @@ Open **Settings** (`Ctrl+,`) and search **`openrouterAgent`**.
 | **`openrouterAgent.shellFallbacks`** | Extra shell paths if defaults fail |
 | **`openrouterAgent.chatFontSize`** | Chat text size in px (`0` = 14px) |
 | **`openrouterAgent.streamResponses`** | Stream replies token-by-token (default: on) |
+| **`openrouterAgent.maxAttachments`** | Max files/images per message (default: 5) |
+| **`openrouterAgent.maxImageSizeMb`** | Max image size in MB (default: 4) |
+| **`openrouterAgent.maxPdfSizeMb`** | Max PDF size in MB (default: 10) |
 
 **Auto** picks one model per message from your available list (settings + **Add model…**), based on mode and what you wrote. Defaults in settings: `z-ai/glm-4.5-air:free`, `openrouter/owl-alpha`.
 

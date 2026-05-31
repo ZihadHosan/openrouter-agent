@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { AttachmentStore } from './attachments';
 import { ApiKeyStore } from './apiKeyStore';
 import { buildPrompt, gatherContext } from './agent';
 import { ChatHistoryStore } from './chatHistory';
@@ -9,16 +10,19 @@ import { promptPermissionMode } from './permissions';
 let chatProvider: ChatViewProvider;
 let modelStore: ModelStore;
 let apiKeyStore: ApiKeyStore;
+let attachmentStore: AttachmentStore;
 
 export function activate(context: vscode.ExtensionContext): void {
   modelStore = new ModelStore(context);
   apiKeyStore = new ApiKeyStore(context);
+  attachmentStore = new AttachmentStore(context);
   const historyStore = new ChatHistoryStore(context);
   chatProvider = new ChatViewProvider(
     context.extensionUri,
     modelStore,
     historyStore,
-    apiKeyStore
+    apiKeyStore,
+    attachmentStore
   );
 
   void apiKeyStore.migrateFromSettingsIfNeeded();

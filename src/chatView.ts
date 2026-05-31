@@ -1,5 +1,16 @@
 import * as vscode from 'vscode';
-import { AgentMode, buildMessagesWithHistory, gatherContext } from './agent';
+import {
+  AgentMode,
+  buildMessagesWithHistory,
+  gatherContext,
+  sessionMessageToApiMessage,
+} from './agent';
+import {
+  AttachmentMeta,
+  AttachmentStore,
+  hasVisionAttachments,
+  modelSupportsVision,
+} from './attachments';
 import { formatAutoModelLabel, pickAutoModel } from './autoModel';
 import { ApiKeyStore } from './apiKeyStore';
 import { ApprovalBridge, PermissionChoice } from './approvalBridge';
@@ -44,13 +55,15 @@ export class ChatViewProvider {
   private pendingUserMessage: string | null = null;
   private activeAbortController?: AbortController;
   private streamActiveForUi = false;
+  private hasVisionInRequest = false;
   private readonly approvalBridge: ApprovalBridge;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly modelStore: ModelStore,
     private readonly historyStore: ChatHistoryStore,
-    private readonly apiKeyStore: ApiKeyStore
+    private readonly apiKeyStore: ApiKeyStore,
+    private readonly attachmentStore: AttachmentStore
   ) {
     this.approvalBridge = new ApprovalBridge((msg) => this.post(msg));
   }
@@ -76,10 +89,11 @@ export class ChatViewProvider {
     mode: AgentMode;
     modelId: string;
   }): void {
+    this.attachmentStore.clearPending();
     this.history = [...session.messages];
     this.mode = session.mode;
     void this.modelStore.setSelectedModelId(session.modelId);
-    this.syncState();
+    void this.syncState();
   }
 
   private getWebview(): vscode.Webview | undefined {
@@ -193,6 +207,8 @@ export class ChatViewProvider {
     id?: string;
     choice?: string;
     url?: string;
+    files?: { name: string; mimeType: string; base64: string }[];
+    attachmentIds?: string[];
   }): Promise<void> {
     switch (msg.type) {
       case 'openLink': {
@@ -208,6 +224,35 @@ export class ChatViewProvider {
           msg.mode as AgentMode,
           String(msg.modelId ?? AUTO_MODEL_ID)
         );
+        break;
+      case 'pickAttachments':
+        if (this.processing) {
+          break;
+        }
+        await this.handlePickAttachments();
+        break;
+      case 'addAttachments': {
+        if (this.processing) {
+          break;
+        }
+        const files = msg.files ?? [];
+        const { added, errors } = await this.attachmentStore.addFromBase64Payload(files);
+        if (errors.length) {
+          void vscode.window.showWarningMessage(
+            `OpenRouter Agent: ${errors.slice(0, 2).join(' ')}`
+          );
+        }
+        if (added.length) {
+          this.postAttachmentsUpdated();
+        }
+        break;
+      }
+      case 'removeAttachment':
+        if (this.processing) {
+          break;
+        }
+        await this.attachmentStore.removePending(String(msg.id ?? ''));
+        this.postAttachmentsUpdated();
         break;
       case 'stop':
         this.handleStop();
@@ -306,7 +351,7 @@ export class ChatViewProvider {
       }
       case 'ready':
         this.loadActiveSession();
-        this.syncState();
+        await this.syncState();
         if (this.pendingUserMessage) {
           const text = this.pendingUserMessage;
           this.pendingUserMessage = null;
@@ -336,14 +381,83 @@ export class ChatViewProvider {
     }
   }
 
-  private syncState(): void {
+  private postAttachmentsUpdated(): void {
+    void this.postPendingAttachmentPreviews();
+  }
+
+  private async postPendingAttachmentPreviews(): Promise<void> {
+    const pending = this.attachmentStore.getPending();
+    const previews: {
+      id: string;
+      name: string;
+      kind: string;
+      mimeType: string;
+      previewUrl?: string;
+    }[] = [];
+    for (const a of pending) {
+      const previewUrl =
+        a.kind === 'image'
+          ? await this.attachmentStore.getPreviewDataUrl('_pending', a)
+          : undefined;
+      previews.push({
+        id: a.id,
+        name: a.name,
+        kind: a.kind,
+        mimeType: a.mimeType,
+        previewUrl,
+      });
+    }
+    this.post({ type: 'attachmentsUpdated', pending: previews });
+  }
+
+  private async handlePickAttachments(): Promise<void> {
+    const { added, errors } = await this.attachmentStore.pickFilesDialog();
+    if (errors.length) {
+      void vscode.window.showWarningMessage(
+        `OpenRouter Agent: ${errors.slice(0, 2).join(' ')}`
+      );
+    }
+    if (added.length) {
+      this.postAttachmentsUpdated();
+    }
+  }
+
+  private async syncState(): Promise<void> {
+    const sessionId = this.historyStore.getActiveId();
+    const attachmentPreviews = await this.attachmentStore.enrichHistoryForWebview(
+      sessionId,
+      this.history
+    );
+    const pending = this.attachmentStore.getPending();
+    const pendingPreviews: {
+      id: string;
+      name: string;
+      kind: string;
+      mimeType: string;
+      previewUrl?: string;
+    }[] = [];
+    for (const a of pending) {
+      const previewUrl =
+        a.kind === 'image'
+          ? await this.attachmentStore.getPreviewDataUrl('_pending', a)
+          : undefined;
+      pendingPreviews.push({
+        id: a.id,
+        name: a.name,
+        kind: a.kind,
+        mimeType: a.mimeType,
+        previewUrl,
+      });
+    }
     this.post({
       type: 'init',
       history: this.history,
+      historyAttachments: attachmentPreviews,
+      pendingAttachments: pendingPreviews,
       mode: this.mode,
       processing: this.processing,
       sessions: this.historyStore.listSessions(),
-      activeSessionId: this.historyStore.getActiveId(),
+      activeSessionId: sessionId,
       chatFontSize: this.getChatFontSize(),
       ...this.modelStore.getStateForWebview(),
     });
@@ -363,12 +477,14 @@ export class ChatViewProvider {
     modelStore: ModelStore;
     apiKeyStore: ApiKeyStore;
     mode: AgentMode;
+    hasVisionAttachments?: boolean;
     signal?: AbortSignal;
   } {
     return {
       modelStore: this.modelStore,
       apiKeyStore: this.apiKeyStore,
       mode: this.mode,
+      hasVisionAttachments: this.hasVisionInRequest,
       signal: this.activeAbortController?.signal,
     };
   }
@@ -459,7 +575,8 @@ export class ChatViewProvider {
     modelId: string
   ): Promise<void> {
     const trimmed = text.trim();
-    if (!trimmed || this.processing) {
+    const pending = this.attachmentStore.getPending();
+    if ((!trimmed && pending.length === 0) || this.processing) {
       return;
     }
 
@@ -475,18 +592,51 @@ export class ChatViewProvider {
       return;
     }
 
+    if (
+      modelId !== AUTO_MODEL_ID &&
+      hasVisionAttachments(pending) &&
+      !modelSupportsVision(modelId)
+    ) {
+      const choice = await vscode.window.showWarningMessage(
+        'The selected model may not support images or PDFs. Use Auto or a vision-capable model?',
+        { modal: true },
+        'Send anyway',
+        'Cancel'
+      );
+      if (choice !== 'Send anyway') {
+        return;
+      }
+    }
+
     await this.modelStore.setSelectedModelId(modelId);
+
+    const sessionId = this.historyStore.getActiveId();
+    const committed = await this.attachmentStore.commitPendingToSession(sessionId);
+    this.postAttachmentsUpdated();
 
     this.processing = true;
     this.mode = mode;
+    this.hasVisionInRequest = hasVisionAttachments(committed);
     this.beginRequest();
-    this.history.push({ role: 'user', content: trimmed });
-    await this.persistSession(trimmed);
-    this.post({ type: 'userMessage', content: trimmed });
+
+    const userMsg: ChatSessionMessage = {
+      role: 'user',
+      content: trimmed,
+      attachments: committed.length ? committed : undefined,
+    };
+    this.history.push(userMsg);
+    await this.persistSession(trimmed || committed[0]?.name);
+
+    const userAttachmentsForUi = await this.enrichAttachmentsForUi(sessionId, committed);
+    this.post({
+      type: 'userMessage',
+      content: trimmed,
+      attachments: userAttachmentsForUi,
+    });
     this.post({
       type: 'sessions',
       sessions: this.historyStore.listSessions(),
-      activeSessionId: this.historyStore.getActiveId(),
+      activeSessionId: sessionId,
     });
 
     const modelLabel =
@@ -496,6 +646,7 @@ export class ChatViewProvider {
               mode,
               userMessage: trimmed,
               conversationLength: this.history.length,
+              hasVisionAttachments: this.hasVisionInRequest,
             }) || '…'
           )
         : modelId.length > 28
@@ -508,12 +659,28 @@ export class ChatViewProvider {
 
     try {
       const context = await gatherContext();
-      const apiHistory: ChatMessage[] = this.history
-        .slice(0, -1)
-        .map((m) => ({ role: m.role, content: m.content }));
+      const apiHistory: ChatMessage[] = [];
+      for (const m of this.history.slice(0, -1)) {
+        if (m.role === 'user' && m.attachments?.length) {
+          const resolved = await this.attachmentStore.loadResolved(sessionId, m.attachments);
+          apiHistory.push(sessionMessageToApiMessage(m, resolved));
+        } else {
+          apiHistory.push({ role: m.role, content: m.content });
+        }
+      }
+
+      const currentResolved = committed.length
+        ? await this.attachmentStore.loadResolved(sessionId, committed)
+        : [];
 
       let response: string;
-      const conversation = buildMessagesWithHistory(mode, trimmed, context, apiHistory);
+      const conversation = buildMessagesWithHistory(
+        mode,
+        trimmed,
+        context,
+        apiHistory,
+        currentResolved
+      );
 
       if (mode === 'plan') {
         this.updateProcess(
@@ -582,10 +749,33 @@ export class ChatViewProvider {
       }
     } finally {
       this.processing = false;
+      this.hasVisionInRequest = false;
       this.activeAbortController = undefined;
       this.streamActiveForUi = false;
       this.setLoading(false);
     }
+  }
+
+  private async enrichAttachmentsForUi(
+    sessionId: string,
+    metas: AttachmentMeta[]
+  ): Promise<
+    { id: string; name: string; kind: string; mimeType: string; previewUrl?: string }[]
+  > {
+    const row: { id: string; name: string; kind: string; mimeType: string; previewUrl?: string }[] =
+      [];
+    for (const a of metas) {
+      const previewUrl =
+        a.kind === 'image' ? await this.attachmentStore.getPreviewDataUrl(sessionId, a) : undefined;
+      row.push({
+        id: a.id,
+        name: a.name,
+        kind: a.kind,
+        mimeType: a.mimeType,
+        previewUrl,
+      });
+    }
+    return row;
   }
 
   private async runToolLoop(
@@ -1640,6 +1830,121 @@ export class ChatViewProvider {
       gap: 8px;
       flex-shrink: 0;
     }
+    .composer.drag-over {
+      border-color: var(--vscode-focusBorder);
+      box-shadow: 0 0 0 1px var(--vscode-focusBorder);
+    }
+    .attachment-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 8px 10px 0;
+      min-height: 0;
+    }
+    .attachment-bar:empty {
+      display: none;
+    }
+    .attachment-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 200px;
+      font-size: 0.75em;
+      padding: 4px 8px 4px 4px;
+      border-radius: 8px;
+      border: 1px solid var(--vscode-panel-border);
+      background: var(--vscode-editor-inactiveSelectionBackground, var(--vscode-input-background));
+      color: var(--vscode-foreground);
+    }
+    .attachment-chip img {
+      width: 28px;
+      height: 28px;
+      object-fit: cover;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+    .attachment-chip-icon {
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      background: var(--vscode-panel-border);
+      font-size: 0.85em;
+      flex-shrink: 0;
+    }
+    .attachment-chip-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .attachment-chip-remove {
+      border: none;
+      background: transparent;
+      color: var(--vscode-foreground);
+      cursor: pointer;
+      padding: 0 2px;
+      opacity: 0.7;
+      font-size: 1.1em;
+      line-height: 1;
+    }
+    .attachment-chip-remove:hover {
+      opacity: 1;
+    }
+    .attach-btn {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: 1px solid var(--vscode-input-border);
+      background: var(--vscode-input-background);
+      color: var(--vscode-foreground);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      padding: 0;
+    }
+    .attach-btn:hover:not(:disabled) {
+      border-color: var(--vscode-focusBorder);
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+    .attach-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .attach-btn svg {
+      width: 16px;
+      height: 16px;
+    }
+    .msg-attachments {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .msg-attachment {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      max-width: 140px;
+    }
+    .msg-attachment img {
+      max-width: 140px;
+      max-height: 100px;
+      border-radius: 6px;
+      border: 1px solid var(--vscode-panel-border);
+      object-fit: contain;
+    }
+    .msg-attachment-label {
+      font-size: 0.72em;
+      color: var(--vscode-descriptionForeground);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .send-spinner {
       width: 18px;
       height: 18px;
@@ -1805,8 +2110,9 @@ export class ChatViewProvider {
     <button type="button" id="jumpToBottomBtn" class="jump-to-bottom hidden" title="Jump to latest">↓ Latest</button>
   </div>
   <div class="composer-wrap">
-    <div class="composer">
-      <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — Enter to send, Shift+Enter for new line"></textarea>
+    <div class="composer" id="composer">
+      <div id="attachmentBar" class="attachment-bar"></div>
+      <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — attach files or images — Enter to send"></textarea>
       <div class="composer-footer">
         <div class="composer-left">
           <div id="modeDropdown"></div>
@@ -1815,6 +2121,9 @@ export class ChatViewProvider {
           </div>
         </div>
         <div class="composer-right">
+          <button type="button" id="attachBtn" class="attach-btn" title="Add files or images" aria-label="Add files">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11.5 4.5l-5.2 5.2a2.12 2.12 0 102.99 2.99l5.8-5.8a3.12 3.12 0 10-4.41-4.41L4.5 9.6" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
+          </button>
           <div id="sendSpinner" class="send-spinner hidden" title="Working…"></div>
           <button type="button" id="sendBtn" class="send-btn" title="Send (Enter)">↑</button>
         </div>
@@ -1831,6 +2140,9 @@ export class ChatViewProvider {
     const messagesEl = document.getElementById('messages');
     const jumpToBottomBtn = document.getElementById('jumpToBottomBtn');
     const inputEl = document.getElementById('input');
+    const composerEl = document.getElementById('composer');
+    const attachmentBar = document.getElementById('attachmentBar');
+    const attachBtn = document.getElementById('attachBtn');
     const sendBtn = document.getElementById('sendBtn');
     const sendSpinner = document.getElementById('sendSpinner');
     const clearBtn = document.getElementById('clearBtn');
@@ -1849,6 +2161,7 @@ export class ChatViewProvider {
     let programmaticScroll = false;
     let approvalPending = false;
     let lastModelId = AUTO_MODEL;
+    let pendingAttachments = [];
 
     var CHEVRON_HTML = '<svg class="dropdown-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     var openDropdown = null;
@@ -2666,21 +2979,49 @@ export class ChatViewProvider {
       updateJumpToBottomButton();
     }
 
-    function appendMessage(role, content, extraClass, details) {
+    function appendMessage(role, content, extraClass, details, attachments) {
       const div = document.createElement('div');
       div.className = 'msg ' + role + (extraClass ? ' ' + extraClass : '');
+      if (attachments && attachments.length) {
+        const attWrap = document.createElement('div');
+        attWrap.className = 'msg-attachments';
+        attachments.forEach(function(a) {
+          const item = document.createElement('div');
+          item.className = 'msg-attachment';
+          if (a.previewUrl) {
+            const img = document.createElement('img');
+            img.src = a.previewUrl;
+            img.alt = a.name;
+            item.appendChild(img);
+          } else {
+            const icon = document.createElement('div');
+            icon.className = 'attachment-chip-icon';
+            icon.textContent = a.kind === 'pdf' ? 'PDF' : 'TXT';
+            item.appendChild(icon);
+          }
+          const label = document.createElement('div');
+          label.className = 'msg-attachment-label';
+          label.textContent = a.name;
+          label.title = a.name;
+          item.appendChild(label);
+          attWrap.appendChild(item);
+        });
+        div.appendChild(attWrap);
+      }
       const body = document.createElement('div');
       body.className = 'msg-body';
-      body.innerHTML = formatContent(content, role);
-      bindMessageLinks(body);
-      wrapTables(body);
       if (role === 'error') {
         const label = document.createElement('div');
         label.className = 'role';
         label.textContent = 'Error';
         div.appendChild(label);
       }
-      div.appendChild(body);
+      if (content) {
+        body.innerHTML = formatContent(content, role);
+        bindMessageLinks(body);
+        wrapTables(body);
+        div.appendChild(body);
+      }
       if (role === 'assistant') {
         appendToolDetails(div, details);
       }
@@ -2816,6 +3157,93 @@ export class ChatViewProvider {
       lastModelId = val;
     }
 
+    function renderPendingAttachments() {
+      if (!attachmentBar) return;
+      attachmentBar.innerHTML = '';
+      pendingAttachments.forEach(function(a) {
+        var chip = document.createElement('div');
+        chip.className = 'attachment-chip';
+        if (a.previewUrl) {
+          var img = document.createElement('img');
+          img.src = a.previewUrl;
+          img.alt = a.name;
+          chip.appendChild(img);
+        } else {
+          var icon = document.createElement('span');
+          icon.className = 'attachment-chip-icon';
+          icon.textContent = a.kind === 'pdf' ? 'PDF' : a.kind === 'image' ? 'IMG' : 'TXT';
+          chip.appendChild(icon);
+        }
+        var name = document.createElement('span');
+        name.className = 'attachment-chip-name';
+        name.textContent = a.name;
+        name.title = a.name;
+        chip.appendChild(name);
+        var rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'attachment-chip-remove';
+        rm.textContent = '×';
+        rm.title = 'Remove';
+        rm.addEventListener('click', function(e) {
+          e.stopPropagation();
+          vscode.postMessage({ type: 'removeAttachment', id: a.id });
+        });
+        chip.appendChild(rm);
+        attachmentBar.appendChild(chip);
+      });
+    }
+
+    function readFilesAsPayload(fileList) {
+      var files = Array.from(fileList || []);
+      if (!files.length) return;
+      var pending = [];
+      var done = 0;
+      files.forEach(function(file) {
+        var reader = new FileReader();
+        reader.onload = function() {
+          pending.push({
+            name: file.name,
+            mimeType: file.type || 'application/octet-stream',
+            base64: String(reader.result || '')
+          });
+          done++;
+          if (done === files.length) {
+            vscode.postMessage({ type: 'addAttachments', files: pending });
+          }
+        };
+        reader.onerror = function() {
+          done++;
+          if (done === files.length && pending.length) {
+            vscode.postMessage({ type: 'addAttachments', files: pending });
+          }
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    if (attachBtn) {
+      attachBtn.addEventListener('click', function() {
+        if (processing || approvalPending) return;
+        vscode.postMessage({ type: 'pickAttachments' });
+      });
+    }
+
+    if (composerEl) {
+      composerEl.addEventListener('dragover', function(e) {
+        e.preventDefault();
+        composerEl.classList.add('drag-over');
+      });
+      composerEl.addEventListener('dragleave', function() {
+        composerEl.classList.remove('drag-over');
+      });
+      composerEl.addEventListener('drop', function(e) {
+        e.preventDefault();
+        composerEl.classList.remove('drag-over');
+        if (processing || approvalPending) return;
+        readFilesAsPayload(e.dataTransfer && e.dataTransfer.files);
+      });
+    }
+
     function updateSendButton() {
       if (processing) {
         sendBtn.classList.add('stop');
@@ -2833,6 +3261,7 @@ export class ChatViewProvider {
     function setLoading(loading, label, process) {
       processing = loading;
       inputEl.disabled = loading || approvalPending;
+      if (attachBtn) attachBtn.disabled = loading || approvalPending;
       modeDropdown.setDisabled(loading || approvalPending);
       modelDropdown.setDisabled(loading || approvalPending);
       sessionDropdown.setDisabled(loading || approvalPending);
@@ -2859,7 +3288,7 @@ export class ChatViewProvider {
 
     function send() {
       const text = inputEl.value.trim();
-      if (!text || processing) return;
+      if ((!text && !pendingAttachments.length) || processing) return;
       stickToBottom = true;
       const modelId = getSelectedModelId();
       vscode.postMessage({
@@ -2869,6 +3298,8 @@ export class ChatViewProvider {
         modelId
       });
       inputEl.value = '';
+      pendingAttachments = [];
+      renderPendingAttachments();
     }
 
     function stop() {
@@ -2916,8 +3347,17 @@ export class ChatViewProvider {
           modeDropdown.setValue(msg.mode || 'ask');
           populateModels(msg);
           populateSessions(msg.sessions, msg.activeSessionId);
-          (msg.history || []).forEach((m) => appendMessage(m.role, m.content, '', m.details));
+          pendingAttachments = msg.pendingAttachments || [];
+          renderPendingAttachments();
+          (msg.history || []).forEach(function(m, i) {
+            var atts = (msg.historyAttachments && msg.historyAttachments[i]) || m.attachments || [];
+            appendMessage(m.role, m.content, '', m.details, atts);
+          });
           setLoading(!!msg.processing, msg.label);
+          break;
+        case 'attachmentsUpdated':
+          pendingAttachments = msg.pending || [];
+          renderPendingAttachments();
           break;
         case 'sessions':
           populateSessions(msg.sessions, msg.activeSessionId);
@@ -2934,7 +3374,7 @@ export class ChatViewProvider {
           break;
         case 'userMessage':
           stickToBottom = true;
-          appendMessage('user', msg.content);
+          appendMessage('user', msg.content, '', undefined, msg.attachments || []);
           break;
         case 'assistantStreamStart':
           morphThinkingToStream();

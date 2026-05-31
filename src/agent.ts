@@ -1,7 +1,13 @@
 import * as vscode from 'vscode';
+import {
+  buildUserMessageContent,
+  ResolvedAttachment,
+} from './attachments';
 import { ChatMessage } from './openrouter';
 
 export type AgentMode = 'ask' | 'plan' | 'agent';
+
+export type { ResolvedAttachment };
 
 const MAX_FILE_CHARS = 12000;
 
@@ -121,15 +127,14 @@ Rules:
 export function buildPrompt(
   mode: AgentMode,
   userText: string,
-  context: PromptContext
+  context: PromptContext,
+  attachments: ResolvedAttachment[] = []
 ): ChatMessage[] {
   const systemContent =
     mode === 'plan' ? PLAN_SYSTEM : mode === 'agent' ? AGENT_SYSTEM : ASK_SYSTEM;
 
   const contextBlock = buildContextBlock(context);
-  const userContent = contextBlock
-    ? `${userText}\n\n---\n**Context:**\n${contextBlock}`
-    : userText;
+  const userContent = buildUserMessageContent(userText, attachments, contextBlock || null);
 
   return [
     { role: 'system', content: systemContent },
@@ -159,13 +164,26 @@ export function buildMessagesWithHistory(
   mode: AgentMode,
   userText: string,
   context: PromptContext,
-  history: ChatMessage[]
+  history: ChatMessage[],
+  attachments: ResolvedAttachment[] = []
 ): ChatMessage[] {
-  const base = buildPrompt(mode, userText, context);
+  const base = buildPrompt(mode, userText, context, attachments);
   if (history.length === 0) {
     return base;
   }
   const system = base[0];
   const rest = history.filter((m) => m.role !== 'system');
   return [system, ...rest, base[1]];
+}
+
+/** Build API history from stored session messages (text-only assistant; user may be multimodal). */
+export function sessionMessageToApiMessage(
+  m: { role: 'user' | 'assistant'; content: string },
+  resolvedAttachments: ResolvedAttachment[]
+): ChatMessage {
+  if (m.role === 'assistant' || resolvedAttachments.length === 0) {
+    return { role: m.role, content: m.content };
+  }
+  const content = buildUserMessageContent(m.content, resolvedAttachments, null);
+  return { role: 'user', content };
 }

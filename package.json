@@ -2,7 +2,7 @@
   "name": "openrouter-agent",
   "displayName": "OpenRouter Agent",
   "description": "Lightweight AI chat for VS Code and Cursor — Ask, Plan, and Agent modes powered by OpenRouter.",
-  "version": "1.3.0",
+  "version": "1.4.1",
   "publisher": "ZihadHosan",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -150,6 +150,30 @@
           "default": true,
           "markdownDescription": "Stream assistant replies token-by-token in chat. Disable for slower machines or if you prefer instant full messages.",
           "order": 6
+        },
+        "openrouterAgent.maxAttachments": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 10,
+          "markdownDescription": "Maximum files or images attached to a single message.",
+          "order": 7
+        },
+        "openrouterAgent.maxImageSizeMb": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 20,
+          "markdownDescription": "Maximum size per image attachment (MB).",
+          "order": 8
+        },
+        "openrouterAgent.maxPdfSizeMb": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 50,
+          "markdownDescription": "Maximum size per PDF attachment (MB).",
+          "order": 9
         }
       }
     }

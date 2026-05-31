@@ -4,7 +4,10 @@ export interface AutoPickContext {
   mode: AgentMode;
   userMessage: string;
   conversationLength?: number;
+  hasVisionAttachments?: boolean;
 }
+
+const VISION = /gemini|gpt-4o|gpt-4\.1|gpt-5|claude|llava|vision|pixtral|qwen-vl|internvl|glm-4v|moondream|llama-3\.2-vision|gpt-4-turbo|:vision/i;
 
 const FAST = /:free|flash|mini|air|haiku|lite|fast|turbo|glm-4\.5-air|gemini-flash/i;
 const REASON = /deepseek|reason|o1|o3|opus|sonnet|gpt-4|gpt-5|thinking|owl|claude/i;
@@ -17,6 +20,13 @@ function scoreModel(modelId: string, ctx: AutoPickContext, listIndex: number): n
   const msgLen = msg.length;
 
   let score = Math.max(0, 3 - listIndex);
+
+  if (ctx.hasVisionAttachments && VISION.test(id)) {
+    score += 20;
+  }
+  if (ctx.hasVisionAttachments && FAST.test(id) && !VISION.test(id)) {
+    score -= 12;
+  }
 
   if (ctx.mode === 'ask') {
     if (FAST.test(id)) score += 14;

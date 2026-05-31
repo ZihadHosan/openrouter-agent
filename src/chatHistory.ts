@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { AgentMode } from './agent';
+import { AttachmentMeta } from './attachments';
 import { AUTO_MODEL_ID } from './models';
 
 export interface ToolDetailEntry {
@@ -11,6 +12,7 @@ export interface ToolDetailEntry {
 export interface ChatSessionMessage {
   role: 'user' | 'assistant';
   content: string;
+  attachments?: AttachmentMeta[];
   details?: ToolDetailEntry[];
 }
 
