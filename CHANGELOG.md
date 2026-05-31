@@ -7,6 +7,20 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 
 ---
 
+## [1.3.0] — 2026-05-30
+
+### Changed
+- **Auto model selection** — picks one model from your available list per request (by Ask / Plan / Agent mode and message), instead of a fixed fallback chain or “free models” label.
+- Removed misleading **Auto = free models** UI copy; settings and README describe Auto behavior accurately.
+
+---
+
+## [Unreleased]
+
+_Nothing yet._
+
+---
+
 ## [1.2.0] — 2026-05-30
 
 ### Changed

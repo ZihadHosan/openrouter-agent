@@ -120,7 +120,7 @@ export function activate(context: vscode.ExtensionContext): void {
           location: vscode.ProgressLocation.Notification,
           title: 'OpenRouter Agent: Fixing selection…',
         },
-        () => askOpenRouter(messages, { modelStore, apiKeyStore })
+        () => askOpenRouter(messages, { modelStore, apiKeyStore, mode: 'ask' })
       );
 
       if (

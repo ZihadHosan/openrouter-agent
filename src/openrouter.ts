@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { AgentMode } from './agent';
+import { pickAutoModel } from './autoModel';
 import { ApiKeyStore } from './apiKeyStore';
 import { AUTO_MODEL_ID, ModelStore } from './models';
 
@@ -10,6 +12,7 @@ export interface ChatMessage {
 export interface AskOpenRouterOptions {
   modelStore?: ModelStore;
   apiKeyStore: ApiKeyStore;
+  mode?: AgentMode;
   signal?: AbortSignal;
   stream?: boolean;
   onChunk?: (delta: string, accumulated: string) => void;
@@ -51,7 +54,8 @@ export function getModels(): string[] {
 
 function buildRequestBody(
   messages: ChatMessage[],
-  modelStore?: ModelStore
+  modelStore?: ModelStore,
+  mode: AgentMode = 'ask'
 ): Record<string, unknown> {
   const selectedId = modelStore?.getSelectedModelId() ?? AUTO_MODEL_ID;
 
@@ -59,11 +63,23 @@ function buildRequestBody(
     return { model: selectedId, messages };
   }
 
-  const fallbacks = modelStore?.getFallbackModels() ?? getModels();
-  if (fallbacks.length === 0) {
+  const available = modelStore?.getAvailableModels() ?? getModels();
+  if (available.length === 0) {
     return { messages };
   }
-  return { models: fallbacks.slice(0, 3), messages };
+
+  const lastUser =
+    [...messages].reverse().find((m) => m.role === 'user')?.content ?? '';
+  const picked = pickAutoModel(available, {
+    mode,
+    userMessage: lastUser,
+    conversationLength: messages.length,
+  });
+
+  if (!picked) {
+    return { messages };
+  }
+  return { model: picked, messages };
 }
 
 function formatApiError(parsed: OpenRouterResponse & { message?: string }, status: number, statusText: string): string {
@@ -152,7 +168,7 @@ export async function askOpenRouter(
     );
   }
 
-  const body = buildRequestBody(messages, options.modelStore);
+  const body = buildRequestBody(messages, options.modelStore, options.mode ?? 'ask');
   if (!('model' in body) && !('models' in body)) {
     return '**Error:** No models configured. Add a model in chat or set `openrouterAgent.models` in Settings.';
   }

@@ -42,18 +42,14 @@ export class ModelStore {
     return result;
   }
 
-  /** Models sent to OpenRouter when Auto is selected (max 3). */
+  /** @deprecated Used only for legacy references; Auto now picks one model via pickAutoModel. */
   getFallbackModels(): string[] {
-    const available = this.getAvailableModels();
-    if (available.length > 0) {
-      return available.slice(0, 3);
-    }
-    return this.getSettingsModels();
+    return this.getAvailableModels().slice(0, 3);
   }
 
   getActiveModelLabel(): string {
     const id = this.getSelectedModelId();
-    return id === AUTO_MODEL_ID ? 'Auto (fallbacks)' : id;
+    return id === AUTO_MODEL_ID ? 'Auto' : id;
   }
 
   async setSelectedModelId(modelId: string): Promise<void> {

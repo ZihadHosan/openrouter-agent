@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { AgentMode, buildMessagesWithHistory, gatherContext } from './agent';
+import { formatAutoModelLabel, pickAutoModel } from './autoModel';
 import { ApiKeyStore } from './apiKeyStore';
 import { ApprovalBridge, PermissionChoice } from './approvalBridge';
 import { ChatHistoryStore } from './chatHistory';
@@ -361,11 +362,13 @@ export class ChatViewProvider {
   private routerOptions(): {
     modelStore: ModelStore;
     apiKeyStore: ApiKeyStore;
+    mode: AgentMode;
     signal?: AbortSignal;
   } {
     return {
       modelStore: this.modelStore,
       apiKeyStore: this.apiKeyStore,
+      mode: this.mode,
       signal: this.activeAbortController?.signal,
     };
   }
@@ -488,7 +491,13 @@ export class ChatViewProvider {
 
     const modelLabel =
       modelId === AUTO_MODEL_ID
-        ? 'Auto'
+        ? formatAutoModelLabel(
+            pickAutoModel(this.modelStore.getAvailableModels(), {
+              mode,
+              userMessage: trimmed,
+              conversationLength: this.history.length,
+            }) || '…'
+          )
         : modelId.length > 28
           ? modelId.slice(0, 28) + '…'
           : modelId;
@@ -1147,18 +1156,7 @@ export class ChatViewProvider {
     .model-picker {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
       min-width: 0;
-    }
-    .model-free-hint {
-      font-size: 0.72em;
-      line-height: 1.2;
-      color: var(--vscode-descriptionForeground);
-      white-space: nowrap;
-      opacity: 0.85;
-    }
-    .model-free-hint.hidden {
-      display: none;
     }
     .dropdown-separator {
       height: 1px;
@@ -1814,7 +1812,6 @@ export class ChatViewProvider {
           <div id="modeDropdown"></div>
           <div class="model-picker">
             <div id="modelDropdown"></div>
-            <span id="modelFreeHint" class="model-free-hint" title="Configure fallbacks in Settings → openrouterAgent.models">Auto = free models</span>
           </div>
         </div>
         <div class="composer-right">
@@ -1839,7 +1836,6 @@ export class ChatViewProvider {
     const clearBtn = document.getElementById('clearBtn');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const deleteSessionBtn = document.getElementById('deleteSessionBtn');
-    const modelFreeHint = document.getElementById('modelFreeHint');
 
     let processing = false;
     let thinkingEl = null;
@@ -2158,15 +2154,6 @@ export class ChatViewProvider {
       title: 'Model',
       value: AUTO_MODEL,
       wideMenu: true,
-      onUpdateTrigger: function(v) {
-        if (modelFreeHint) {
-          if (v === AUTO_MODEL) {
-            modelFreeHint.classList.remove('hidden');
-          } else {
-            modelFreeHint.classList.add('hidden');
-          }
-        }
-      },
       onBeforeSelect: function(opt) {
         if (opt.value === ADD_MODEL) {
           vscode.postMessage({ type: 'promptAddModel' });
@@ -2813,7 +2800,7 @@ export class ChatViewProvider {
         value: AUTO_MODEL,
         label: 'Auto',
         shortLabel: 'Auto',
-        title: 'Try free fallback models (Settings → openrouterAgent.models). Use Add model… for paid models.'
+        title: 'Picks the best model from your available list based on mode and message (Settings → openrouterAgent.models, Add model…).'
       }];
       models.forEach(function(m) {
         opts.push({ value: m, label: m, shortLabel: shortModelLabel(m), title: m });
