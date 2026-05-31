@@ -1,0 +1,14 @@
+---
+description: Git commit authorship — no Cursor co-author trailers
+alwaysApply: true
+---
+
+# Git commits — author only
+
+When creating git commits in this repository:
+
+- Do **not** add `Co-authored-by: Cursor <cursoragent@cursor.com>` or any other co-author trailer.
+- Do **not** add `Made-with: Cursor` or any Cursor attribution to commit messages.
+- Commit messages must list **only** the user's authorship (Zihad Hosan).
+
+If a commit hook or tool tries to append Cursor attribution, strip it before the commit is finalized.
