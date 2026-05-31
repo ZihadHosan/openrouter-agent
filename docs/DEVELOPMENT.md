@@ -44,6 +44,8 @@ Open the repo folder in VS Code/Cursor (`File → Open Folder`).
 npm install          # once
 npm run compile      # build TypeScript (runs version bump when src/ changes)
 npm run watch        # rebuild on save
+npm run package:vsix # compile + create .vsix in project root
+npm run publish:marketplace  # compile + package + upload to Marketplace (requires vsce login)
 ```
 
 ### Version bumps
@@ -89,6 +91,8 @@ Reinstalling a new VSIX over an old one is fine — no uninstall needed.
 ---
 
 ## Publish to VS Code Marketplace
+
+**→ Step-by-step release checklist: [RELEASE.md](./RELEASE.md)** (PAT setup, version bump, publish commands)
 
 ### One-time setup
 

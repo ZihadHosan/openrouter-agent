@@ -172,9 +172,13 @@ Full disclosure: **[PRIVACY.md](./PRIVACY.md)** — what is sent to OpenRouter a
 
 ## Development
 
-Building from source, VSIX packaging, F5 debug, and Marketplace publishing:
+Building from source, F5 debug, and full contributor guide:
 
 **[docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)**
+
+**Release checklist** (local VSIX + Marketplace publish — use this when shipping a new version):
+
+**[docs/RELEASE.md](./docs/RELEASE.md)**
 
 ---
 

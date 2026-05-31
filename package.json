@@ -159,7 +159,9 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
-    "version:sync": "node scripts/bump-version-on-change.mjs"
+    "version:sync": "node scripts/bump-version-on-change.mjs",
+    "package:vsix": "npm run compile && npx @vscode/vsce package --allow-missing-repository",
+    "publish:marketplace": "npm run package:vsix && npx @vscode/vsce publish"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
