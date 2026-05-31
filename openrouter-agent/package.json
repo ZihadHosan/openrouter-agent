@@ -1,0 +1,123 @@
+{
+  "name": "openrouter-agent",
+  "displayName": "OpenRouter Agent",
+ "description": "Lightweight AI assistant using OpenRouter with Ask, Plan, and Agent modes",
+  "version": "0.4.4",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:openrouterAgent.openChat"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "openrouterAgent.openChat",
+        "title": "OpenRouter: Open Chat",
+        "shortTitle": "Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "openrouterAgent.askCurrentFile",
+        "title": "OpenRouter: Ask About Current File"
+      },
+      {
+        "command": "openrouterAgent.explainSelection",
+        "title": "OpenRouter: Explain Selection"
+      },
+      {
+        "command": "openrouterAgent.fixSelection",
+        "title": "OpenRouter: Fix Selection"
+      },
+      {
+        "command": "openrouterAgent.setPermissions",
+        "title": "OpenRouter: Agent Permissions"
+      },
+      {
+        "command": "openrouterAgent.setApiKey",
+        "title": "OpenRouter: Set API Key"
+      },
+      {
+        "command": "openrouterAgent.clearApiKey",
+        "title": "OpenRouter: Clear API Key"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "openrouterAgent.openChat",
+        "key": "ctrl+alt+l",
+        "mac": "cmd+alt+l"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "openrouterAgent.openChat",
+          "group": "navigation@100",
+          "when": "true"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "OpenRouter Agent",
+      "properties": {
+        "openrouterAgent.models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "z-ai/glm-4.5-air:free",
+            "openrouter/owl-alpha",
+            "deepseek/deepseek-v4-flash"
+          ],
+          "markdownDescription": "Fallback models (max 3) when **Auto** is selected in chat.\n\n**API key:** not stored here — use Command Palette → `OpenRouter: Set API Key` (masked, secure storage).",
+          "maxItems": 3,
+          "order": 1
+        },
+        "openrouterAgent.agentPermissions": {
+          "type": "string",
+          "enum": ["ask", "readOnly", "workspace", "full"],
+          "enumDescriptions": [
+            "Ask before file writes and terminal commands.",
+            "Auto-approve list/read files only.",
+            "Auto-approve reads and file writes; ask before terminal commands.",
+            "Auto-approve reads, writes, and safe commands. Destructive commands always ask."
+          ],
+          "default": "ask",
+          "markdownDescription": "Control when the agent runs tools without asking. Change quickly via **OpenRouter: Agent Permissions** in the Command Palette.",
+          "order": 2
+        },
+        "openrouterAgent.shell": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Primary shell for in-chat commands. **Leave empty** to use VS Code default + built-in fallbacks (PowerShell, Git Bash, cmd, WSL on Windows; bash/zsh/sh on macOS/Linux).",
+          "order": 3
+        },
+        "openrouterAgent.shellFallbacks": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "Extra shell paths tried after the default chain. Example: `C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe`",
+          "order": 4
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
