@@ -10,6 +10,21 @@ export interface ChatMessage {
 export interface AskOpenRouterOptions {
   modelStore?: ModelStore;
   apiKeyStore: ApiKeyStore;
+  signal?: AbortSignal;
+}
+
+export class AskOpenRouterAbortedError extends Error {
+  constructor() {
+    super('Request aborted');
+    this.name = 'AskOpenRouterAbortedError';
+  }
+}
+
+export function isAskOpenRouterAborted(err: unknown): boolean {
+  return (
+    err instanceof AskOpenRouterAbortedError ||
+    (err instanceof Error && err.name === 'AbortError')
+  );
 }
 
 interface OpenRouterChoice {
@@ -76,9 +91,18 @@ export async function askOpenRouter(
         'X-Title': 'OpenRouter Agent VS Code Extension',
       },
       body: JSON.stringify(body),
+      signal: options.signal,
     });
 
+    if (options.signal?.aborted) {
+      throw new AskOpenRouterAbortedError();
+    }
+
     const parsed = (await response.json()) as OpenRouterResponse & { message?: string };
+
+    if (options.signal?.aborted) {
+      throw new AskOpenRouterAbortedError();
+    }
 
     if (!response.ok) {
       const detail =
@@ -95,6 +119,9 @@ export async function askOpenRouter(
 
     return content;
   } catch (err) {
+    if (options.signal?.aborted || isAskOpenRouterAborted(err)) {
+      throw new AskOpenRouterAbortedError();
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return `**Network Error:** ${msg}`;
   }

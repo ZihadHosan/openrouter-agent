@@ -111,9 +111,11 @@
     }
   },
   "scripts": {
+    "precompile": "node scripts/bump-version-on-change.mjs",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile"
+    "pretest": "npm run compile",
+    "version:sync": "node scripts/bump-version-on-change.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

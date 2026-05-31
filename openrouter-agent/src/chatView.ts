@@ -7,7 +7,7 @@ import type { ChatSessionMessage, ToolDetailEntry } from './chatHistory';
 import { ADD_MODEL_OPTION, AUTO_MODEL_ID, ModelStore } from './models';
 
 export type { ChatSessionMessage, ToolDetailEntry };
-import { askOpenRouter, ChatMessage } from './openrouter';
+import { askOpenRouter, AskOpenRouterAbortedError, ChatMessage } from './openrouter';
 import {
   describeProcessDone,
   describeProcessStep,
@@ -29,6 +29,7 @@ import {
 const MAX_AGENT_ITERATIONS = 16;
 const MAX_PARSE_RETRIES = 2;
 const MAX_UNVERIFIED_RETRIES = 2;
+const STOPPED_MESSAGE = '_Stopped._';
 
 /** Single chat UI — one WebviewPanel on the right (no sidebar duplicate). */
 export class ChatViewProvider {
@@ -39,6 +40,7 @@ export class ChatViewProvider {
   private mode: AgentMode = 'ask';
   private processing = false;
   private pendingUserMessage: string | null = null;
+  private activeAbortController?: AbortController;
   private readonly approvalBridge: ApprovalBridge;
 
   constructor(
@@ -171,6 +173,9 @@ export class ChatViewProvider {
           msg.mode as AgentMode,
           String(msg.modelId ?? AUTO_MODEL_ID)
         );
+        break;
+      case 'stop':
+        this.handleStop();
         break;
       case 'clear':
         this.history = [];
@@ -312,6 +317,41 @@ export class ChatViewProvider {
     void this.getWebview()?.postMessage(message);
   }
 
+  private beginRequest(): AbortSignal {
+    this.activeAbortController?.abort();
+    this.activeAbortController = new AbortController();
+    return this.activeAbortController.signal;
+  }
+
+  private routerOptions(): {
+    modelStore: ModelStore;
+    apiKeyStore: ApiKeyStore;
+    signal?: AbortSignal;
+  } {
+    return {
+      modelStore: this.modelStore,
+      apiKeyStore: this.apiKeyStore,
+      signal: this.activeAbortController?.signal,
+    };
+  }
+
+  private isAborted(): boolean {
+    return this.activeAbortController?.signal.aborted ?? false;
+  }
+
+  private handleStop(): void {
+    if (!this.processing) {
+      return;
+    }
+    this.activeAbortController?.abort();
+    this.approvalBridge.cancelAll();
+    this.setLoading(true, 'Stopping…');
+  }
+
+  private async callOpenRouter(conversation: ChatMessage[]): Promise<string> {
+    return askOpenRouter(conversation, this.routerOptions());
+  }
+
   private setLoading(
     loading: boolean,
     label?: string,
@@ -363,6 +403,7 @@ export class ChatViewProvider {
 
     this.processing = true;
     this.mode = mode;
+    this.beginRequest();
     this.history.push({ role: 'user', content: trimmed });
     await this.persistSession(trimmed);
     this.post({ type: 'userMessage', content: trimmed });
@@ -398,11 +439,10 @@ export class ChatViewProvider {
           'Step 1: Planning…',
           'Reviewing your request and drafting a plan…'
         );
-        response = await askOpenRouter(conversation, {
-          modelStore: this.modelStore,
-          apiKeyStore: this.apiKeyStore,
-        });
-        if (hasToolCallMarkup(response)) {
+        response = await this.callOpenRouter(conversation);
+        if (this.isAborted()) {
+          response = STOPPED_MESSAGE;
+        } else if (hasToolCallMarkup(response)) {
           const visible = stripToolBlock(response);
           response =
             (visible || '') +
@@ -435,10 +475,22 @@ export class ChatViewProvider {
         activeSessionId: this.historyStore.getActiveId(),
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.post({ type: 'error', message: msg });
+      if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
+        this.history.push({ role: 'assistant', content: STOPPED_MESSAGE });
+        await this.persistSession();
+        this.post({ type: 'assistantMessage', content: STOPPED_MESSAGE });
+        this.post({
+          type: 'sessions',
+          sessions: this.historyStore.listSessions(),
+          activeSessionId: this.historyStore.getActiveId(),
+        });
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.post({ type: 'error', message: msg });
+      }
     } finally {
       this.processing = false;
+      this.activeAbortController = undefined;
       this.setLoading(false);
     }
   }
@@ -448,6 +500,10 @@ export class ChatViewProvider {
     allowWrites: boolean,
     userText: string
   ): Promise<{ content: string; details: ToolDetailEntry[] }> {
+    if (this.isAborted()) {
+      return { content: STOPPED_MESSAGE, details: [] };
+    }
+
     const displayParts: string[] = [];
     const details: ToolDetailEntry[] = [];
     const completedSteps: string[] = [];
@@ -459,7 +515,7 @@ export class ChatViewProvider {
     const needsVerification = requiresFileVerification(userText);
 
     const autoCall = buildAutoToolCall(detectUserFileIntent(userText));
-    if (autoCall) {
+    if (autoCall && !this.isAborted()) {
       const resolved = resolveToolCall(autoCall);
       stepNum++;
       const toolStep = describeProcessStep(stepNum, 'tool', resolved);
@@ -479,15 +535,28 @@ export class ChatViewProvider {
     }
 
     for (let i = 0; i < MAX_AGENT_ITERATIONS; i++) {
+      if (this.isAborted()) {
+        return { content: STOPPED_MESSAGE, details };
+      }
+
       stepNum++;
       const thinkStep = describeProcessStep(stepNum, 'thinking');
       this.updateProcess(completedSteps, thinkStep);
 
-      const raw = await askOpenRouter(conversation, {
-        modelStore: this.modelStore,
-        apiKeyStore: this.apiKeyStore,
-      });
+      let raw: string;
+      try {
+        raw = await this.callOpenRouter(conversation);
+      } catch (err) {
+        if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
+          return { content: STOPPED_MESSAGE, details };
+        }
+        throw err;
+      }
       lastAssistant = raw;
+
+      if (this.isAborted()) {
+        return { content: STOPPED_MESSAGE, details };
+      }
 
       if (
         raw.startsWith('**Error:**') ||
@@ -601,6 +670,10 @@ export class ChatViewProvider {
         break;
       }
       toolsRun++;
+
+      if (this.isAborted()) {
+        return { content: STOPPED_MESSAGE, details };
+      }
     }
 
     if (displayParts.length > 0) {
@@ -613,8 +686,18 @@ export class ChatViewProvider {
     }
 
     if (details.length > 0) {
-      const content = await this.fetchFinalSummary(conversation, completedSteps, needsVerification);
-      return { content, details };
+      if (this.isAborted()) {
+        return { content: STOPPED_MESSAGE, details };
+      }
+      try {
+        const content = await this.fetchFinalSummary(conversation, completedSteps, needsVerification);
+        return { content, details };
+      } catch (err) {
+        if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
+          return { content: STOPPED_MESSAGE, details };
+        }
+        throw err;
+      }
     }
 
     return {
@@ -747,10 +830,18 @@ export class ChatViewProvider {
           : ''),
     });
 
-    const raw = await askOpenRouter(conversation, {
-      modelStore: this.modelStore,
-      apiKeyStore: this.apiKeyStore,
-    });
+    let raw: string;
+    try {
+      raw = await this.callOpenRouter(conversation);
+    } catch (err) {
+      if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
+        return STOPPED_MESSAGE;
+      }
+      throw err;
+    }
+    if (this.isAborted()) {
+      return STOPPED_MESSAGE;
+    }
     if (
       raw.startsWith('**Error:**') ||
       raw.startsWith('**API Error:**') ||
@@ -1117,6 +1208,11 @@ export class ChatViewProvider {
     .send-btn:hover:not(:disabled) {
       filter: brightness(1.08);
     }
+    .send-btn.stop {
+      background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
+      color: var(--vscode-errorForeground, #f48771);
+      font-size: 11px;
+    }
     @keyframes spin { to { transform: rotate(360deg); } }
     .approval-card {
       margin: 8px 0;
@@ -1246,7 +1342,7 @@ export class ChatViewProvider {
   <div id="messages"></div>
   <div class="composer-wrap">
     <div class="composer">
-      <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — Ctrl+Enter to send"></textarea>
+      <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — Enter to send, Shift+Enter for new line"></textarea>
       <div class="composer-footer">
         <div class="composer-left">
           <select id="mode" class="pill-select" title="Mode">
@@ -1258,7 +1354,7 @@ export class ChatViewProvider {
         </div>
         <div class="composer-right">
           <div id="sendSpinner" class="send-spinner hidden" title="Working…"></div>
-          <button type="button" id="sendBtn" class="send-btn" title="Send (Ctrl+Enter)">↑</button>
+          <button type="button" id="sendBtn" class="send-btn" title="Send (Enter)">↑</button>
         </div>
       </div>
     </div>
@@ -1642,9 +1738,22 @@ export class ChatViewProvider {
       modelSelectEl.dataset.lastValue = modelSelectEl.value;
     }
 
+    function updateSendButton() {
+      if (processing) {
+        sendBtn.classList.add('stop');
+        sendBtn.textContent = '■';
+        sendBtn.title = 'Stop';
+        sendBtn.disabled = false;
+      } else {
+        sendBtn.classList.remove('stop');
+        sendBtn.textContent = '↑';
+        sendBtn.title = 'Send (Enter)';
+        sendBtn.disabled = approvalPending;
+      }
+    }
+
     function setLoading(loading, label, process) {
       processing = loading;
-      sendBtn.disabled = loading || approvalPending;
       inputEl.disabled = loading || approvalPending;
       modeEl.disabled = loading || approvalPending;
       modelSelectEl.disabled = loading || approvalPending;
@@ -1652,6 +1761,7 @@ export class ChatViewProvider {
       newSessionBtn.disabled = loading || approvalPending;
       deleteSessionBtn.disabled = loading || approvalPending;
       clearBtn.disabled = loading || approvalPending;
+      updateSendButton();
       if (loading) {
         sendSpinner.classList.remove('hidden');
         if (thinkingEl) {
@@ -1677,7 +1787,18 @@ export class ChatViewProvider {
       inputEl.value = '';
     }
 
-    sendBtn.addEventListener('click', send);
+    function stop() {
+      if (!processing) return;
+      vscode.postMessage({ type: 'stop' });
+    }
+
+    sendBtn.addEventListener('click', () => {
+      if (processing) {
+        stop();
+      } else {
+        send();
+      }
+    });
     clearBtn.addEventListener('click', () => {
       if (processing) return;
       vscode.postMessage({ type: 'clear' });
@@ -1710,9 +1831,11 @@ export class ChatViewProvider {
       vscode.postMessage({ type: 'setModel', modelId: modelSelectEl.value });
     });
     inputEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        send();
+        if (!processing) {
+          send();
+        }
       }
     });
 
@@ -1775,13 +1898,12 @@ export class ChatViewProvider {
           break;
         case 'approvalPending':
           approvalPending = !!msg.pending;
-          if (approvalPending) {
-            sendBtn.disabled = true;
-            inputEl.disabled = true;
-          } else if (!processing) {
-            sendBtn.disabled = false;
-            inputEl.disabled = false;
+          inputEl.disabled = processing || approvalPending;
+          if (!processing) {
+            modeEl.disabled = approvalPending;
+            modelSelectEl.disabled = approvalPending;
           }
+          updateSendButton();
           break;
         case 'terminalRunStart':
           createTerminalBlock(
