@@ -162,7 +162,20 @@ export function buildAutoToolCall(intent: UserFileIntent): ToolCall | null {
   }
 }
 
-export function requiresFileVerification(userText: string): boolean {
+export function requiresFileVerification(
+  userText: string,
+  options?: { hasAttachments?: boolean }
+): boolean {
+  if (options?.hasAttachments) {
+    if (
+      /\b(workspace|other files|also (?:check|read|compare)|compare with|in the repo|in the project)\b/i.test(
+        userText
+      )
+    ) {
+      return detectUserFileIntent(userText).kind !== null;
+    }
+    return false;
+  }
   if (detectUserFileIntent(userText).kind !== null) {
     return true;
   }
@@ -484,7 +497,11 @@ export function parseToolCall(text: string): ToolCall | null {
 export function stripToolBlock(text: string): string {
   const normalized = sanitizeModelOutput(text);
   return normalized
-    .replace(/```agent-tool\s*\n[\s\S]*?```/g, '')
+    .replace(/```agent-tool\s*\n[\s\S]*?```/gi, '')
+    .replace(/```agent-tool[^\n]*\n[\s\S]*?```/gi, '')
+    .replace(/```\s*agent-tool[\s\S]*?```/gi, '')
+    .replace(/^\s*\{"tool"\s*:\s*"[\w-]+"[\s\S]*?\}\s*$/gm, '')
+    .replace(/^\s*\{[\s\S]*?"tool"\s*:\s*"[\w-]+"[\s\S]*?\}\s*$/gm, '')
     .replace(/<\|function_calls_begin\|>[\s\S]*?<\|function_calls_end\|>/gi, '')
     .replace(/<\|function_call_begin\|>[\s\S]*?<\|function_call_end\|>/gi, '')
     .replace(/<\|function_call_begin\|>[\s\S]*?<\|function_sep\|>\s*\{[\s\S]*?\}/gi, '')

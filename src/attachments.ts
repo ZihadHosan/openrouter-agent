@@ -79,6 +79,49 @@ export function hasVisionAttachments(attachments: AttachmentMeta[]): boolean {
   return attachments.some((a) => a.kind === 'image' || a.kind === 'pdf');
 }
 
+export function hasTextAttachments(
+  attachments: Pick<AttachmentMeta, 'kind'>[]
+): boolean {
+  return attachments.some((a) => a.kind === 'text' || a.kind === 'pdf');
+}
+
+export function formatAttachmentTextBlock(a: ResolvedAttachment): string {
+  if (a.kind === 'text' && a.textContent !== undefined) {
+    return `--- ${a.name} ---\n${a.textContent}\n--- end ${a.name} ---`;
+  }
+  if (a.kind === 'pdf') {
+    return `--- ${a.name} (PDF attached separately) ---`;
+  }
+  return '';
+}
+
+export function formatInlineAttachmentSection(attachments: ResolvedAttachment[]): string {
+  const textBlocks = attachments
+    .filter((a) => a.kind === 'text' || a.kind === 'pdf')
+    .map(formatAttachmentTextBlock)
+    .filter(Boolean);
+  if (textBlocks.length === 0) {
+    return '';
+  }
+  const names = attachments
+    .filter((a) => a.kind === 'text' || a.kind === 'pdf')
+    .map((a) => a.name)
+    .join(', ');
+  return (
+    `[ATTACHED FILES — full content below for: ${names}. ` +
+    `Analyze these directly; do NOT use read_file/list_files for these filenames unless the user asks to compare with workspace copies.]\n\n` +
+    textBlocks.join('\n\n')
+  );
+}
+
+export function attachmentAnalysisLabel(attachments: AttachmentMeta[]): string {
+  const names = attachments.map((a) => a.name);
+  if (names.length === 1) {
+    return names[0];
+  }
+  return `${names.length} files`;
+}
+
 export function modelSupportsVision(modelId: string): boolean {
   const id = modelId.toLowerCase();
   return (
@@ -88,51 +131,56 @@ export function modelSupportsVision(modelId: string): boolean {
   );
 }
 
-export function attachmentsToContentParts(attachments: ResolvedAttachment[]): ContentPart[] {
-  const parts: ContentPart[] = [];
-  for (const a of attachments) {
-    if (a.kind === 'image' && a.dataUrl) {
-      parts.push({ type: 'image_url', image_url: { url: a.dataUrl } });
-    } else if (a.kind === 'pdf' && a.dataUrl) {
-      parts.push({
-        type: 'file',
-        file: { filename: a.name, file_data: a.dataUrl },
-      });
-    } else if (a.kind === 'text' && a.textContent !== undefined) {
-      parts.push({
-        type: 'text',
-        text: `--- Attached file: ${a.name} ---\n${a.textContent}\n--- End ${a.name} ---`,
-      });
-    }
-  }
-  return parts;
-}
-
 export function buildUserMessageContent(
   userText: string,
   attachments: ResolvedAttachment[],
   contextBlock: string | null
 ): string | ContentPart[] {
-  const parts: ContentPart[] = [];
   const text = userText.trim();
+  const images = attachments.filter((a) => a.kind === 'image');
+  const pdfs = attachments.filter((a) => a.kind === 'pdf' && a.dataUrl);
+  const inlineSection = formatInlineAttachmentSection(attachments);
 
+  const textParts: string[] = [];
+  if (inlineSection) {
+    textParts.push(inlineSection);
+  }
   if (text) {
-    parts.push({ type: 'text', text });
+    textParts.push(`User request: ${text}`);
+  } else if (inlineSection) {
+    textParts.push('User request: analyze the attached file(s).');
   }
-
-  parts.push(...attachmentsToContentParts(attachments));
-
   if (contextBlock) {
-    parts.push({ type: 'text', text: `---\n**Context:**\n${contextBlock}` });
+    textParts.push(`---\n**Context:**\n${contextBlock}`);
   }
 
-  if (parts.length === 0) {
-    return '';
+  const flatText = textParts.join('\n\n').trim();
+  const visionParts: ContentPart[] = [];
+
+  for (const a of images) {
+    if (a.dataUrl) {
+      visionParts.push({ type: 'image_url', image_url: { url: a.dataUrl } });
+    }
   }
-  if (parts.length === 1 && parts[0].type === 'text') {
-    return parts[0].text;
+  for (const a of pdfs) {
+    if (a.dataUrl) {
+      visionParts.push({
+        type: 'file',
+        file: { filename: a.name, file_data: a.dataUrl },
+      });
+    }
   }
-  return parts;
+
+  if (visionParts.length === 0) {
+    return flatText;
+  }
+
+  const parts: ContentPart[] = [];
+  if (flatText) {
+    parts.push({ type: 'text', text: flatText });
+  }
+  parts.push(...visionParts);
+  return parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts;
 }
 
 function newAttachmentId(): string {

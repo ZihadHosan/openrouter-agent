@@ -23,6 +23,40 @@ _Nothing yet._
 
 ---
 
+## [1.6.1] — 2026-05-30
+
+### Added
+- **Remove model…** in the chat model dropdown — removes models added via **Add model…** (default Settings models are still edited in `openrouterAgent.models`).
+
+---
+
+## [1.6.0] — 2026-05-30
+
+### Added
+- **Paste screenshots** — Ctrl+V / Cmd+V in the message box attaches clipboard images (Win+Shift+S, Print Screen, etc.).
+
+### Fixed
+- **Image attachment previews** — thumbnails in the attachment bar and chat history render correctly (webview CSP allows `data:` URLs).
+- **Vision warning dialog** — single Cancel button; **Use Auto** and **Send anyway** options when a non-vision model is selected with images/PDFs.
+- **Paperclip icon** alignment in the attach button.
+
+### Changed
+- **Auto + images/PDFs** — picks only from vision-capable models in your list; blocks send with a clear message if none are configured.
+- OpenRouter image-input errors include a hint to switch to **Auto** or add a vision model.
+
+---
+
+## [1.5.0] — 2026-05-30
+
+### Changed
+- **Attachment analysis (hybrid mode)** — text/PDF attachments are flattened into a single user message with file content before your question, so weaker models read inline content first.
+- When attachments are present, turn 1 skips automatic workspace file listing/verification; the UI shows **Analyzing &lt;filename&gt;…** instead of generic file checks.
+- System prompt tells the model to analyze attached content directly and not call `read_file` for attached filenames unless you ask to compare with workspace copies.
+- Raw tool JSON (`{"tool":"read_file",...}` and `agent-tool` blocks) is stripped from streamed and final chat output when attachments are on the message.
+- Soft hint when using free models with text attachments: **Auto** or a stronger model may give cleaner results.
+
+---
+
 ## [1.3.0] — 2026-05-30
 
 ### Changed

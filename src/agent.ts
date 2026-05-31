@@ -59,6 +59,14 @@ FORMATTING:
 - For tables, always include a header row and a separator row (| --- | --- |) before data rows.
 - Never output special delimiter tokens (e.g. <|channel|>, <|message|>, <|start|>, <|end|>). Reply with plain markdown only.`;
 
+const ATTACHMENT_SYSTEM = `
+
+ATTACHED FILES (this message):
+- The user attached file(s) with FULL CONTENT already included in their message below the [ATTACHED FILES] header.
+- Analyze, summarize, or answer questions about that content DIRECTLY — do not ask which file they mean.
+- Do NOT call read_file, list_files, or read_glob for attached filenames unless the user explicitly asks to compare with workspace copies or read other paths.
+- Never show raw tool JSON (e.g. \`\`\`agent-tool or {"tool":"read_file"...}) in your reply to the user.`;
+
 const ASK_SYSTEM = `You are a helpful coding assistant in VS Code ASK MODE.
 
 You can read ANY file in the workspace automatically (read-only). Use tools to list or read files when the user asks about them.
@@ -130,8 +138,10 @@ export function buildPrompt(
   context: PromptContext,
   attachments: ResolvedAttachment[] = []
 ): ChatMessage[] {
-  const systemContent =
+  const baseSystem =
     mode === 'plan' ? PLAN_SYSTEM : mode === 'agent' ? AGENT_SYSTEM : ASK_SYSTEM;
+  const systemContent =
+    attachments.length > 0 ? baseSystem + ATTACHMENT_SYSTEM : baseSystem;
 
   const contextBlock = buildContextBlock(context);
   const userContent = buildUserMessageContent(userText, attachments, contextBlock || null);

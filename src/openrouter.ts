@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { AgentMode } from './agent';
-import { pickAutoModel } from './autoModel';
+import { pickAutoModelForRequest } from './autoModel';
 import { ApiKeyStore } from './apiKeyStore';
 import { AUTO_MODEL_ID, ModelStore } from './models';
 
@@ -90,7 +90,7 @@ function buildRequestBody(
 
   const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
   const lastUser = lastUserMsg ? messageContentToText(lastUserMsg.content) : '';
-  const picked = pickAutoModel(available, {
+  const picked = pickAutoModelForRequest(available, {
     mode,
     userMessage: lastUser,
     conversationLength: messages.length,
@@ -108,7 +108,12 @@ function formatApiError(parsed: OpenRouterResponse & { message?: string }, statu
     parsed.error?.message ??
     parsed.message ??
     `HTTP ${status} ${statusText}`;
-  return `**API Error:** ${detail}`;
+  let msg = `**API Error:** ${detail}`;
+  if (/image input|vision|multimodal/i.test(detail)) {
+    msg +=
+      '\n\nSwitch to **Auto** or add a vision-capable model (e.g. Gemini Flash, GPT-4o, Claude) via **Add model…**.';
+  }
+  return msg;
 }
 
 async function readSseStream(

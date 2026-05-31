@@ -60,7 +60,7 @@ Remove it anytime: **`OpenRouter: Clear API Key`**.
 ### 4. Send a message
 
 - **Enter** to send · **Shift+Enter** for a new line
-- **Paperclip** or drag-and-drop to attach images, PDFs, or text/code files
+- **Paperclip**, **Ctrl+V / Cmd+V** (paste screenshots), or drag-and-drop to attach images, PDFs, or text/code files
 - Pick **Ask**, **Plan**, or **Agent** and a **model** below the input
 - While the model works, **↑** becomes **Stop (■)**
 
@@ -73,8 +73,8 @@ Remove it anytime: **`OpenRouter: Clear API Key`**.
 - **Agent** — Read, write (with approval), and terminal commands (with approval)
 - **Streaming replies** — Token-by-token responses (disable in settings)
 - **Chat history** — Sessions saved automatically; switch or start new chats
-- **Any OpenRouter model** — Built-in list + **Add model…** in chat
-- **Attachments** — Images, PDFs, and workspace files in chat (vision-aware **Auto** model pick)
+- **Any OpenRouter model** — Settings list + **Add model…** / **Remove model…** in chat (chat-added models are stored separately from Settings)
+- **Attachments** — Images, PDFs, and text/code files in chat. **Images and PDFs require a vision-capable model** (or **Auto** with at least one vision model in your list). Paste screenshots with Ctrl+V / Cmd+V. Text/PDF content is inlined for direct analysis; **Agent** can still use workspace tools for other paths in follow-ups.
 - **Smart scroll** — Follows new text unless you scroll up to read earlier content
 
 ---
@@ -107,6 +107,15 @@ Best for multi-step work with your approval.
 
 Default permission level: **`OpenRouter: Agent Permissions`** (Command Palette).
 
+### Attachments
+
+- **Text/code files** (`.md`, `.txt`, source files, etc.) and **PDFs** are sent inline in your message — the model should analyze them without listing the workspace first.
+- **Images** and **PDFs** require a **vision-capable** model (e.g. Gemini Flash, GPT-4o, Claude). **Auto** picks only from vision-capable models in your list when images/PDFs are attached.
+- **Paste screenshots** into the message box with **Ctrl+V** (Mac: **Cmd+V**) after Win+Shift+S, Print Screen, or any screenshot tool.
+- **Paperclip** and drag-and-drop also work for images, PDFs, and text files.
+- In **Agent** or **Ask**, you can still ask about *other* workspace files in the same or a follow-up message; tools run normally for those paths.
+- Text-only models (including many DeepSeek ids) cannot accept image input on OpenRouter — use **Auto** or add a vision model via **Add model…**.
+
 ---
 
 ## Settings
@@ -125,7 +134,16 @@ Open **Settings** (`Ctrl+,`) and search **`openrouterAgent`**.
 | **`openrouterAgent.maxImageSizeMb`** | Max image size in MB (default: 4) |
 | **`openrouterAgent.maxPdfSizeMb`** | Max PDF size in MB (default: 10) |
 
-**Auto** picks one model per message from your available list (settings + **Add model…**), based on mode and what you wrote. Defaults in settings: `z-ai/glm-4.5-air:free`, `openrouter/owl-alpha`.
+**Auto** picks one model per message from your available list (settings + chat-added models), based on mode and what you wrote. Defaults in settings: `z-ai/glm-4.5-air:free`, `openrouter/owl-alpha`.
+
+### Managing models
+
+| Action | Where |
+|--------|--------|
+| **Default models** (up to 3) | **Settings** → `openrouterAgent.models` |
+| **Add a model** | Chat model dropdown → **Add model…** (saved in extension storage, not shown in Settings) |
+| **Remove a chat-added model** | Chat model dropdown → **Remove model…** |
+| **Remove a Settings model** | Edit or delete its entry in `openrouterAgent.models` |
 
 ---
 

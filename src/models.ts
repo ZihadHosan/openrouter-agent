@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 
 export const AUTO_MODEL_ID = '__auto__';
 export const ADD_MODEL_OPTION = '__add_model__';
+export const REMOVE_MODEL_OPTION = '__remove_model__';
 
 const CUSTOM_MODELS_KEY = 'openrouterAgent.customModels';
 const SELECTED_MODEL_KEY = 'openrouterAgent.selectedModel';
@@ -70,6 +71,24 @@ export class ModelStore {
     }
     const custom = [...this.getCustomModels(), trimmed];
     await this.context.globalState.update(CUSTOM_MODELS_KEY, custom);
+    return { ok: true };
+  }
+
+  async removeCustomModel(model: string): Promise<{ ok: boolean; error?: string }> {
+    const trimmed = model.trim();
+    if (!trimmed) {
+      return { ok: false, error: 'Model id cannot be empty.' };
+    }
+    const custom = this.getCustomModels();
+    if (!custom.includes(trimmed)) {
+      return {
+        ok: false,
+        error:
+          'That model is not in your chat-added list. Edit Settings → openrouterAgent.models to change default models.',
+      };
+    }
+    const next = custom.filter((m) => m !== trimmed);
+    await this.context.globalState.update(CUSTOM_MODELS_KEY, next);
     return { ok: true };
   }
 

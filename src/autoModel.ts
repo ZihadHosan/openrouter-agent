@@ -1,4 +1,5 @@
 import { AgentMode } from './agent';
+import { modelSupportsVision } from './attachments';
 
 export interface AutoPickContext {
   mode: AgentMode;
@@ -53,6 +54,25 @@ function scoreModel(modelId: string, ctx: AutoPickContext, listIndex: number): n
   }
 
   return score;
+}
+
+/** Pick one model; when vision attachments are present, only vision-capable models are considered. */
+export function pickAutoModelForRequest(
+  availableModels: string[],
+  ctx: AutoPickContext
+): string | null {
+  const models = availableModels.map((m) => m.trim()).filter(Boolean);
+  if (models.length === 0) {
+    return null;
+  }
+  if (ctx.hasVisionAttachments) {
+    const visionOnly = models.filter((m) => modelSupportsVision(m));
+    if (visionOnly.length === 0) {
+      return null;
+    }
+    return pickAutoModel(visionOnly, ctx) || null;
+  }
+  return pickAutoModel(models, ctx) || null;
 }
 
 /** Pick one model from the user's available list for this request. */

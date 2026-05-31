@@ -8,15 +8,17 @@ import {
 import {
   AttachmentMeta,
   AttachmentStore,
+  attachmentAnalysisLabel,
+  hasTextAttachments,
   hasVisionAttachments,
   modelSupportsVision,
 } from './attachments';
-import { formatAutoModelLabel, pickAutoModel } from './autoModel';
+import { formatAutoModelLabel, pickAutoModelForRequest } from './autoModel';
 import { ApiKeyStore } from './apiKeyStore';
 import { ApprovalBridge, PermissionChoice } from './approvalBridge';
 import { ChatHistoryStore } from './chatHistory';
 import type { ChatSessionMessage, ToolDetailEntry } from './chatHistory';
-import { ADD_MODEL_OPTION, AUTO_MODEL_ID, ModelStore } from './models';
+import { ADD_MODEL_OPTION, AUTO_MODEL_ID, ModelStore, REMOVE_MODEL_OPTION } from './models';
 
 export type { ChatSessionMessage, ToolDetailEntry };
 import { askOpenRouter, AskOpenRouterAbortedError, ChatMessage } from './openrouter';
@@ -56,6 +58,7 @@ export class ChatViewProvider {
   private activeAbortController?: AbortController;
   private streamActiveForUi = false;
   private hasVisionInRequest = false;
+  private stripToolLeaksInStream = false;
   private readonly approvalBridge: ApprovalBridge;
 
   constructor(
@@ -286,13 +289,15 @@ export class ChatViewProvider {
           break;
         }
         const id = String(msg.sessionId ?? '');
+        const deleteItem: vscode.MessageItem = { title: 'Delete' };
+        const cancelDelete: vscode.MessageItem = { title: 'Cancel', isCloseAffordance: true };
         const choice = await vscode.window.showWarningMessage(
           'Delete this chat from history?',
           { modal: true },
-          'Delete',
-          'Cancel'
+          deleteItem,
+          cancelDelete
         );
-        if (choice !== 'Delete') {
+        if (choice !== deleteItem) {
           this.post({
             type: 'sessions',
             sessions: this.historyStore.listSessions(),
@@ -347,6 +352,42 @@ export class ChatViewProvider {
           );
           this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
         }
+        break;
+      }
+      case 'promptRemoveModel': {
+        const custom = this.modelStore.getCustomModels();
+        if (custom.length === 0) {
+          void vscode.window.showInformationMessage(
+            'OpenRouter Agent: No chat-added models to remove. Edit Settings (openrouterAgent.models) to change default models.'
+          );
+          this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
+          break;
+        }
+        const picked = await vscode.window.showQuickPick(
+          custom.map((m) => ({ label: m, description: 'Added via Add model… in chat' })),
+          {
+            title: 'Remove OpenRouter Model',
+            placeHolder: 'Select a chat-added model to remove from the dropdown',
+            ignoreFocusOut: true,
+          }
+        );
+        if (!picked) {
+          this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
+          break;
+        }
+        const result = await this.modelStore.removeCustomModel(picked.label);
+        if (!result.ok) {
+          void vscode.window.showWarningMessage(
+            `OpenRouter Agent: ${result.error ?? 'Could not remove model.'}`
+          );
+          this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
+          break;
+        }
+        if (this.modelStore.getSelectedModelId() === picked.label) {
+          await this.modelStore.setSelectedModelId(AUTO_MODEL_ID);
+        }
+        await this.persistSession();
+        this.post({ type: 'modelRemoved', ...this.modelStore.getStateForWebview() });
         break;
       }
       case 'ready':
@@ -527,7 +568,13 @@ export class ChatViewProvider {
       ...this.routerOptions(),
       stream: true,
       onChunk: (_delta, accumulated) => {
-        const content = sanitizeModelOutput(accumulated);
+        let content = sanitizeModelOutput(accumulated);
+        if (this.stripToolLeaksInStream) {
+          content = stripToolBlock(content);
+        }
+        if (!content) {
+          return;
+        }
         if (!streamStarted) {
           streamStarted = true;
           this.streamActiveForUi = true;
@@ -541,7 +588,11 @@ export class ChatViewProvider {
       this.streamActiveForUi = false;
     }
 
-    return sanitizeModelOutput(result);
+    let finalText = sanitizeModelOutput(result);
+    if (this.stripToolLeaksInStream) {
+      finalText = stripToolBlock(finalText);
+    }
+    return finalText;
   }
 
   private setLoading(
@@ -594,21 +645,60 @@ export class ChatViewProvider {
 
     if (
       modelId !== AUTO_MODEL_ID &&
+      hasTextAttachments(pending) &&
+      /:free|owl-alpha|glm-4\.5-air/i.test(modelId)
+    ) {
+      void vscode.window.showInformationMessage(
+        'OpenRouter Agent: For attached file analysis, Auto or a stronger model may give cleaner results.'
+      );
+    }
+
+    if (
+      modelId !== AUTO_MODEL_ID &&
       hasVisionAttachments(pending) &&
       !modelSupportsVision(modelId)
     ) {
+      const useAutoItem: vscode.MessageItem = { title: 'Use Auto' };
+      const sendAnywayItem: vscode.MessageItem = { title: 'Send anyway' };
+      const cancelVision: vscode.MessageItem = { title: 'Cancel', isCloseAffordance: true };
       const choice = await vscode.window.showWarningMessage(
         'The selected model may not support images or PDFs. Use Auto or a vision-capable model?',
         { modal: true },
-        'Send anyway',
-        'Cancel'
+        useAutoItem,
+        sendAnywayItem,
+        cancelVision
       );
-      if (choice !== 'Send anyway') {
+      if (!choice || choice === cancelVision) {
+        return;
+      }
+      if (choice === useAutoItem) {
+        modelId = AUTO_MODEL_ID;
+      } else if (choice !== sendAnywayItem) {
+        return;
+      }
+    }
+
+    if (modelId === AUTO_MODEL_ID && hasVisionAttachments(pending)) {
+      const visionPick = pickAutoModelForRequest(this.modelStore.getAvailableModels(), {
+        mode,
+        userMessage: trimmed,
+        conversationLength: this.history.length,
+        hasVisionAttachments: true,
+      });
+      if (!visionPick) {
+        this.post({
+          type: 'error',
+          message:
+            'No vision-capable model in your list. Add one via **Add model…** (e.g. google/gemini-2.0-flash-001) or pick a vision model.',
+        });
         return;
       }
     }
 
     await this.modelStore.setSelectedModelId(modelId);
+    if (modelId === AUTO_MODEL_ID) {
+      this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
+    }
 
     const sessionId = this.historyStore.getActiveId();
     const committed = await this.attachmentStore.commitPendingToSession(sessionId);
@@ -617,6 +707,7 @@ export class ChatViewProvider {
     this.processing = true;
     this.mode = mode;
     this.hasVisionInRequest = hasVisionAttachments(committed);
+    this.stripToolLeaksInStream = committed.length > 0;
     this.beginRequest();
 
     const userMsg: ChatSessionMessage = {
@@ -642,7 +733,7 @@ export class ChatViewProvider {
     const modelLabel =
       modelId === AUTO_MODEL_ID
         ? formatAutoModelLabel(
-            pickAutoModel(this.modelStore.getAvailableModels(), {
+            pickAutoModelForRequest(this.modelStore.getAvailableModels(), {
               mode,
               userMessage: trimmed,
               conversationLength: this.history.length,
@@ -652,9 +743,15 @@ export class ChatViewProvider {
         : modelId.length > 28
           ? modelId.slice(0, 28) + '…'
           : modelId;
-    this.setLoading(true, `Step 1: Thinking with ${modelLabel}…`, {
+    const attachLabel =
+      committed.length > 0 ? attachmentAnalysisLabel(committed) : '';
+    const initialStep =
+      attachLabel.length > 0
+        ? `Analyzing ${attachLabel}…`
+        : `Step 1: Thinking with ${modelLabel}…`;
+    this.setLoading(true, initialStep, {
       completed: [],
-      current: `Step 1: Thinking with ${modelLabel}…`,
+      current: initialStep,
     });
 
     try {
@@ -692,15 +789,24 @@ export class ChatViewProvider {
         if (this.isAborted()) {
           this.cancelStreamUi();
           response = STOPPED_MESSAGE;
-        } else if (hasToolCallMarkup(response)) {
-          const visible = stripToolBlock(response);
-          response =
-            (visible || '') +
-            '\n\n💡 **Plan mode** does not run tools. Switch to **Agent** (or **Ask** for read-only) to explore files.';
+        } else {
+          const hadToolMarkup = hasToolCallMarkup(response);
+          if (this.stripToolLeaksInStream || hadToolMarkup) {
+            response = stripToolBlock(response) || response;
+          }
+          if (hadToolMarkup) {
+            response +=
+              '\n\n💡 **Plan mode** does not run tools. Switch to **Agent** (or **Ask** for read-only) to explore files.';
+          }
         }
       } else {
-        const out = await this.runToolLoop(conversation, mode === 'agent', trimmed);
-        response = sanitizeModelOutput(out.content);
+        const out = await this.runToolLoop(conversation, mode === 'agent', trimmed, {
+          hasAttachments: committed.length > 0,
+          attachmentLabel: attachLabel,
+        });
+        response = this.stripToolLeaksInStream
+          ? stripToolBlock(sanitizeModelOutput(out.content))
+          : sanitizeModelOutput(out.content);
         this.history.push({ role: 'assistant', content: response, details: out.details });
         await this.persistSession();
         this.post({
@@ -750,6 +856,7 @@ export class ChatViewProvider {
     } finally {
       this.processing = false;
       this.hasVisionInRequest = false;
+      this.stripToolLeaksInStream = false;
       this.activeAbortController = undefined;
       this.streamActiveForUi = false;
       this.setLoading(false);
@@ -781,12 +888,14 @@ export class ChatViewProvider {
   private async runToolLoop(
     conversation: ChatMessage[],
     allowWrites: boolean,
-    userText: string
+    userText: string,
+    options: { hasAttachments?: boolean; attachmentLabel?: string } = {}
   ): Promise<{ content: string; details: ToolDetailEntry[] }> {
     if (this.isAborted()) {
       return { content: STOPPED_MESSAGE, details: [] };
     }
 
+    const hasAttachments = options.hasAttachments ?? false;
     const displayParts: string[] = [];
     const details: ToolDetailEntry[] = [];
     const completedSteps: string[] = [];
@@ -795,9 +904,9 @@ export class ChatViewProvider {
     let toolsRun = 0;
     let parseRetries = 0;
     let unverifiedRetries = 0;
-    const needsVerification = requiresFileVerification(userText);
+    const needsVerification = requiresFileVerification(userText, { hasAttachments });
 
-    const autoCall = buildAutoToolCall(detectUserFileIntent(userText));
+    const autoCall = hasAttachments ? null : buildAutoToolCall(detectUserFileIntent(userText));
     if (autoCall && !this.isAborted()) {
       const resolved = resolveToolCall(autoCall);
       stepNum++;
@@ -823,7 +932,9 @@ export class ChatViewProvider {
       }
 
       stepNum++;
-      const thinkStep = describeProcessStep(stepNum, 'thinking');
+      const thinkStep = hasAttachments && stepNum === 1 && options.attachmentLabel
+        ? `Analyzing ${options.attachmentLabel}…`
+        : describeProcessStep(stepNum, 'thinking');
       this.updateProcess(completedSteps, thinkStep);
 
       let raw: string;
@@ -967,10 +1078,15 @@ export class ChatViewProvider {
     }
 
     if (displayParts.length > 0) {
-      return { content: displayParts.join('\n\n'), details };
+      const joined = displayParts.join('\n\n');
+      return {
+        content: hasAttachments ? stripToolBlock(joined) || joined : joined,
+        details,
+      };
     }
 
-    const fallback = cleanAssistantVisibleText(lastAssistant) || stripToolBlock(lastAssistant);
+    const fallback =
+      cleanAssistantVisibleText(lastAssistant) || stripToolBlock(lastAssistant);
     if (fallback && !(needsVerification && toolsRun === 0)) {
       return { content: fallback, details };
     }
@@ -1161,6 +1277,7 @@ export class ChatViewProvider {
   private getHtml(webview: vscode.Webview): string {
     const nonce = getNonce();
     const addModelOption = ADD_MODEL_OPTION;
+    const removeModelOption = REMOVE_MODEL_OPTION;
     const markedUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'marked.min.js')
     );
@@ -1171,7 +1288,7 @@ export class ChatViewProvider {
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' ${webview.cspSource};" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob: ${webview.cspSource}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' ${webview.cspSource};" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OpenRouter Chat</title>
   <style>
@@ -1906,6 +2023,7 @@ export class ChatViewProvider {
       justify-content: center;
       flex-shrink: 0;
       padding: 0;
+      line-height: 0;
     }
     .attach-btn:hover:not(:disabled) {
       border-color: var(--vscode-focusBorder);
@@ -1916,8 +2034,10 @@ export class ChatViewProvider {
       cursor: not-allowed;
     }
     .attach-btn svg {
+      display: block;
       width: 16px;
       height: 16px;
+      flex-shrink: 0;
     }
     .msg-attachments {
       display: flex;
@@ -2112,7 +2232,7 @@ export class ChatViewProvider {
   <div class="composer-wrap">
     <div class="composer" id="composer">
       <div id="attachmentBar" class="attachment-bar"></div>
-      <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — attach files or images — Enter to send"></textarea>
+      <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — attach, paste, or drop images — Enter to send"></textarea>
       <div class="composer-footer">
         <div class="composer-left">
           <div id="modeDropdown"></div>
@@ -2137,6 +2257,7 @@ export class ChatViewProvider {
     const vscode = acquireVsCodeApi();
     const AUTO_MODEL = '${AUTO_MODEL_ID}';
     const ADD_MODEL = '${addModelOption}';
+    const REMOVE_MODEL = '${removeModelOption}';
     const messagesEl = document.getElementById('messages');
     const jumpToBottomBtn = document.getElementById('jumpToBottomBtn');
     const inputEl = document.getElementById('input');
@@ -2470,6 +2591,10 @@ export class ChatViewProvider {
       onBeforeSelect: function(opt) {
         if (opt.value === ADD_MODEL) {
           vscode.postMessage({ type: 'promptAddModel' });
+          return false;
+        }
+        if (opt.value === REMOVE_MODEL) {
+          vscode.postMessage({ type: 'promptRemoveModel' });
           return false;
         }
         return true;
@@ -3148,6 +3273,7 @@ export class ChatViewProvider {
       });
       opts.push({ separator: true });
       opts.push({ value: ADD_MODEL, label: 'Add model…' });
+      opts.push({ value: REMOVE_MODEL, label: 'Remove model…', title: 'Remove a model added via Add model… (Settings models: edit openrouterAgent.models)' });
       var val = selected;
       if (selected !== AUTO_MODEL && models.indexOf(selected) === -1) {
         val = models.length ? models[0] : AUTO_MODEL;
@@ -3193,7 +3319,36 @@ export class ChatViewProvider {
       });
     }
 
-    function readFilesAsPayload(fileList) {
+    function clipMimeToExt(mime) {
+      if (mime === 'image/png') return 'png';
+      if (mime === 'image/jpeg' || mime === 'image/jpg') return 'jpg';
+      if (mime === 'image/webp') return 'webp';
+      if (mime === 'image/gif') return 'gif';
+      if (mime === 'application/pdf') return 'pdf';
+      return 'png';
+    }
+
+    function screenshotFilename(mime) {
+      var d = new Date();
+      var pad = function(n) { return String(n).padStart(2, '0'); };
+      var stamp =
+        d.getFullYear() +
+        pad(d.getMonth() + 1) +
+        pad(d.getDate()) +
+        '-' +
+        pad(d.getHours()) +
+        pad(d.getMinutes()) +
+        pad(d.getSeconds());
+      return 'Screenshot-' + stamp + '.' + clipMimeToExt(mime);
+    }
+
+    function needsPastedFilename(name) {
+      if (!name) return true;
+      var lower = name.toLowerCase();
+      return lower === 'image.png' || lower === 'blob' || lower === 'image.jpg' || lower === 'image.jpeg';
+    }
+
+    function addFilesFromList(fileList) {
       var files = Array.from(fileList || []);
       if (!files.length) return;
       var pending = [];
@@ -3219,6 +3374,30 @@ export class ChatViewProvider {
         };
         reader.readAsDataURL(file);
       });
+    }
+
+    function readFilesAsPayload(fileList) {
+      addFilesFromList(fileList);
+    }
+
+    function handlePasteAttachments(e) {
+      if (processing || approvalPending) return;
+      var cd = e.clipboardData;
+      if (!cd || !cd.items) return;
+      var attachable = [];
+      for (var i = 0; i < cd.items.length; i++) {
+        var item = cd.items[i];
+        if (item.kind !== 'file') continue;
+        var mime = item.type || '';
+        if (mime.indexOf('image/') !== 0 && mime !== 'application/pdf') continue;
+        var raw = item.getAsFile();
+        if (!raw) continue;
+        var name = needsPastedFilename(raw.name) ? screenshotFilename(mime) : raw.name;
+        attachable.push(new File([raw], name, { type: mime || raw.type }));
+      }
+      if (!attachable.length) return;
+      e.preventDefault();
+      addFilesFromList(attachable);
     }
 
     if (attachBtn) {
@@ -3336,6 +3515,7 @@ export class ChatViewProvider {
         }
       }
     });
+    inputEl.addEventListener('paste', handlePasteAttachments);
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
@@ -3371,6 +3551,11 @@ export class ChatViewProvider {
             modelDropdown.setValue(msg.modelId);
             lastModelId = msg.modelId;
           }
+          break;
+        case 'modelRemoved':
+          populateModels(msg);
+          modelDropdown.setValue(msg.selectedModelId || AUTO_MODEL);
+          lastModelId = msg.selectedModelId || AUTO_MODEL;
           break;
         case 'userMessage':
           stickToBottom = true;
