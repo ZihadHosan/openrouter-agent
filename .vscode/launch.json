@@ -5,13 +5,9 @@
       "name": "Run OpenRouter Agent",
       "type": "extensionHost",
       "request": "launch",
-      "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/openrouter-agent"
-      ],
-      "outFiles": [
-        "${workspaceFolder}/openrouter-agent/dist/**/*.js"
-      ],
-      "preLaunchTask": "compile-openrouter-agent"
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "compile"
     }
   ]
 }

@@ -2,10 +2,9 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "compile-openrouter-agent",
+      "label": "compile",
       "type": "npm",
       "script": "compile",
-      "path": "openrouter-agent",
       "group": {
         "kind": "build",
         "isDefault": true
