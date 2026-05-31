@@ -50,7 +50,8 @@ FORMATTING:
 - Use markdown for replies (headings, bullet/numbered lists, tables when helpful).
 - Do NOT wrap your entire reply in one code fence (\`\`\`); only fence real code snippets.
 - Write normal prose outside code blocks so it renders as readable chat text.
-- For tables, always include a header row and a separator row (| --- | --- |) before data rows.`;
+- For tables, always include a header row and a separator row (| --- | --- |) before data rows.
+- Never output special delimiter tokens (e.g. <|channel|>, <|message|>, <|start|>, <|end|>). Reply with plain markdown only.`;
 
 const ASK_SYSTEM = `You are a helpful coding assistant in VS Code ASK MODE.
 

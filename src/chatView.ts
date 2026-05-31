@@ -23,6 +23,7 @@ import {
   requiresFileVerification,
   resolveToolCall,
   stripToolBlock,
+  sanitizeModelOutput,
   type ToolCall,
 } from './tools';
 
@@ -384,7 +385,7 @@ export class ChatViewProvider {
   }
 
   private async callOpenRouter(conversation: ChatMessage[]): Promise<string> {
-    return askOpenRouter(conversation, this.routerOptions());
+    return sanitizeModelOutput(await askOpenRouter(conversation, this.routerOptions()));
   }
 
   private cancelStreamUi(): void {
@@ -407,12 +408,13 @@ export class ChatViewProvider {
       ...this.routerOptions(),
       stream: true,
       onChunk: (_delta, accumulated) => {
+        const content = sanitizeModelOutput(accumulated);
         if (!streamStarted) {
           streamStarted = true;
           this.streamActiveForUi = true;
           this.post({ type: 'assistantStreamStart' });
         }
-        this.post({ type: 'assistantPartial', content: accumulated });
+        this.post({ type: 'assistantPartial', content });
       },
     });
 
@@ -420,7 +422,7 @@ export class ChatViewProvider {
       this.streamActiveForUi = false;
     }
 
-    return result;
+    return sanitizeModelOutput(result);
   }
 
   private setLoading(
@@ -522,7 +524,7 @@ export class ChatViewProvider {
         }
       } else {
         const out = await this.runToolLoop(conversation, mode === 'agent', trimmed);
-        response = out.content;
+        response = sanitizeModelOutput(out.content);
         this.history.push({ role: 'assistant', content: response, details: out.details });
         await this.persistSession();
         this.post({
@@ -540,6 +542,7 @@ export class ChatViewProvider {
         return;
       }
 
+      response = sanitizeModelOutput(response);
       this.history.push({ role: 'assistant', content: response });
       await this.persistSession();
       this.post({

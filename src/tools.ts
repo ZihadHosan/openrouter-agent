@@ -232,6 +232,30 @@ export function normalizeModelToolSyntax(text: string): string {
   return text.replace(/<\s*\|\s*([^|>]+?)\s*\|\s*>/g, '<|$1|>');
 }
 
+/** Remove harmony/channel delimiters (e.g. openrouter/owl-alpha `<|channel|>final<|message|>`). */
+export function sanitizeModelOutput(text: string): string {
+  const normalized = normalizeModelToolSyntax(text);
+  if (!/<\|channel\|>/i.test(normalized)) {
+    return normalized;
+  }
+
+  const finalParts: string[] = [];
+  const finalRe = /<\|channel\|>final<\|message\|>([\s\S]*?)(?=<\|channel\|>|$)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = finalRe.exec(normalized)) !== null) {
+    finalParts.push(match[1]);
+  }
+  if (finalParts.length > 0) {
+    return finalParts.join('\n\n').trim();
+  }
+
+  return normalized
+    .replace(/<\|channel\|>[^<\n]*<\|message\|>/gi, '')
+    .replace(/<\|end\|>/gi, '')
+    .replace(/<\|start\|>/gi, '')
+    .trim();
+}
+
 function jsonObjectToStrArgs(obj: Record<string, unknown>): Record<string, string> {
   const strArgs: Record<string, string> = {};
   for (const [k, v] of Object.entries(obj)) {
@@ -458,7 +482,7 @@ export function parseToolCall(text: string): ToolCall | null {
 }
 
 export function stripToolBlock(text: string): string {
-  const normalized = normalizeModelToolSyntax(text);
+  const normalized = sanitizeModelOutput(text);
   return normalized
     .replace(/```agent-tool\s*\n[\s\S]*?```/g, '')
     .replace(/<\|function_calls_begin\|>[\s\S]*?<\|function_calls_end\|>/gi, '')
