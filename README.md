@@ -27,6 +27,13 @@ code --install-extension ZihadHosan.openrouter-agent
 
 ## Get started
 
+### First-time setup (quick path)
+
+1. **Install** from Extensions → search **OpenRouter Agent** → **Install** → **Reload** if prompted.
+2. **Set API key** — **Ctrl+Shift+P** → **`OpenRouter: Set API Key`** → paste a key from [openrouter.ai/keys](https://openrouter.ai/keys).
+3. **Open chat** — click **OpenRouter** in the status bar, or press **Ctrl+Alt+L** (Mac: **Cmd+Alt+L**), or run **`OpenRouter: Open Chat`** from the Command Palette.
+4. **Send a message** — pick **Ask**, **Plan**, or **Agent**; leave **Auto** for free fallback models, or choose / add a specific model.
+
 ### 1. Open a workspace
 
 Open a project folder (**File → Open Folder**). **Ask** and **Agent** modes need a workspace on disk to read files.
@@ -106,14 +113,14 @@ Open **Settings** (`Ctrl+,`) and search **`openrouterAgent`**.
 
 | Setting | Purpose |
 |---------|---------|
-| **`openrouterAgent.models`** | Up to 3 fallback models when **Auto** is selected |
+| **`openrouterAgent.models`** | Up to 3 **free** fallback models when **Auto** is selected (defaults are free-tier; add paid models in chat) |
 | **`openrouterAgent.agentPermissions`** | `ask` · `readOnly` · `workspace` · `full` |
 | **`openrouterAgent.shell`** | Custom shell for in-chat commands |
 | **`openrouterAgent.shellFallbacks`** | Extra shell paths if defaults fail |
 | **`openrouterAgent.chatFontSize`** | Chat text size in px (`0` = 14px) |
 | **`openrouterAgent.streamResponses`** | Stream replies token-by-token (default: on) |
 
-Default **Auto** models: `z-ai/glm-4.5-air:free`, `openrouter/owl-alpha`, `deepseek/deepseek-v4-flash`.
+Default **Auto** models (free): `z-ai/glm-4.5-air:free`, `openrouter/owl-alpha`. Use **Add model…** in chat for any OpenRouter model id (including paid).
 
 ---
 

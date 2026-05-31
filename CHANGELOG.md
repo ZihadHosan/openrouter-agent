@@ -7,10 +7,19 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 
 ---
 
-## [Unreleased]
+## [1.2.0] — 2026-05-30
 
 ### Changed
-- **README** rewritten for Marketplace users (install, get started, features); build/VSIX/publish moved to **[docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)**.
+- **Model dropdown** — wider menu with full model ids; trigger stays compact (Auto / shortened names).
+- **Default Auto models** — free-tier only (`z-ai/glm-4.5-air:free`, `openrouter/owl-alpha`); removed paid DeepSeek default.
+- Settings and chat hint clarify that **Auto** uses free fallbacks; paid models via **Add model…**.
+- **README** — first-time setup quick path for new installs.
+
+---
+
+## [Unreleased]
+
+_Nothing yet._
 
 ---
 
@@ -118,8 +127,3 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 ### Fixed
 - Git commit attribution — Cursor co-author trailers removed from history.
 
----
-
-## [Unreleased]
-
-_Work in progress will be listed here before the next version bump._

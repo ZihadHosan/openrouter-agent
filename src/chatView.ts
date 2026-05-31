@@ -1136,6 +1136,30 @@ export class ChatViewProvider {
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder));
       color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
     }
+    .dropdown-menu-wide {
+      min-width: 280px;
+      max-width: min(420px, calc(100vw - 16px));
+    }
+    .dropdown-menu-wide .dropdown-item {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.8em;
+    }
+    .model-picker {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+    .model-free-hint {
+      font-size: 0.72em;
+      line-height: 1.2;
+      color: var(--vscode-descriptionForeground);
+      white-space: nowrap;
+      opacity: 0.85;
+    }
+    .model-free-hint.hidden {
+      display: none;
+    }
     .dropdown-separator {
       height: 1px;
       margin: 4px 8px;
@@ -1788,7 +1812,10 @@ export class ChatViewProvider {
       <div class="composer-footer">
         <div class="composer-left">
           <div id="modeDropdown"></div>
-          <div id="modelDropdown"></div>
+          <div class="model-picker">
+            <div id="modelDropdown"></div>
+            <span id="modelFreeHint" class="model-free-hint" title="Configure fallbacks in Settings → openrouterAgent.models">Auto = free models</span>
+          </div>
         </div>
         <div class="composer-right">
           <div id="sendSpinner" class="send-spinner hidden" title="Working…"></div>
@@ -1812,6 +1839,7 @@ export class ChatViewProvider {
     const clearBtn = document.getElementById('clearBtn');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const deleteSessionBtn = document.getElementById('deleteSessionBtn');
+    const modelFreeHint = document.getElementById('modelFreeHint');
 
     let processing = false;
     let thinkingEl = null;
@@ -1863,17 +1891,34 @@ export class ChatViewProvider {
       var value = settings.value || '';
       var disabled = false;
 
-      function findLabel(val) {
+      function findOption(val) {
         for (var i = 0; i < options.length; i++) {
           if (!options[i].separator && options[i].value === val) {
-            return options[i].label;
+            return options[i];
           }
+        }
+        return null;
+      }
+
+      function findLabel(val) {
+        var opt = findOption(val);
+        if (opt) {
+          return opt.shortLabel || opt.label;
         }
         return val;
       }
 
       function updateTrigger() {
+        var opt = findOption(value);
         labelEl.textContent = findLabel(value) || value || settings.placeholder || 'Select';
+        if (opt && opt.title) {
+          trigger.title = opt.title;
+        } else if (settings.title) {
+          trigger.title = settings.title;
+        }
+        if (settings.onUpdateTrigger) {
+          settings.onUpdateTrigger(value, opt);
+        }
       }
 
       function renderMenu() {
@@ -1941,8 +1986,18 @@ export class ChatViewProvider {
         root.classList.remove('open-above');
         menu.style.position = 'fixed';
         menu.style.left = rect.left + 'px';
-        menu.style.width = rect.width + 'px';
-        menu.style.minWidth = rect.width + 'px';
+
+        if (settings.wideMenu) {
+          menu.classList.add('dropdown-menu-wide');
+          menu.style.width = 'auto';
+          menu.style.minWidth = Math.max(280, Math.round(rect.width)) + 'px';
+          menu.style.maxWidth = '';
+        } else {
+          menu.classList.remove('dropdown-menu-wide');
+          menu.style.width = rect.width + 'px';
+          menu.style.minWidth = rect.width + 'px';
+          menu.style.maxWidth = '';
+        }
 
         if (openBelow) {
           menu.style.top = (rect.bottom + gap) + 'px';
@@ -2102,6 +2157,16 @@ export class ChatViewProvider {
       triggerClass: 'pill-trigger model-trigger',
       title: 'Model',
       value: AUTO_MODEL,
+      wideMenu: true,
+      onUpdateTrigger: function(v) {
+        if (modelFreeHint) {
+          if (v === AUTO_MODEL) {
+            modelFreeHint.classList.remove('hidden');
+          } else {
+            modelFreeHint.classList.add('hidden');
+          }
+        }
+      },
       onBeforeSelect: function(opt) {
         if (opt.value === ADD_MODEL) {
           vscode.postMessage({ type: 'promptAddModel' });
@@ -2744,9 +2809,14 @@ export class ChatViewProvider {
     function populateModels(state) {
       const models = state.availableModels || [];
       const selected = state.selectedModelId || AUTO_MODEL;
-      var opts = [{ value: AUTO_MODEL, label: 'Auto' }];
+      var opts = [{
+        value: AUTO_MODEL,
+        label: 'Auto',
+        shortLabel: 'Auto',
+        title: 'Try free fallback models (Settings → openrouterAgent.models). Use Add model… for paid models.'
+      }];
       models.forEach(function(m) {
-        opts.push({ value: m, label: shortModelLabel(m), title: m });
+        opts.push({ value: m, label: m, shortLabel: shortModelLabel(m), title: m });
       });
       opts.push({ separator: true });
       opts.push({ value: ADD_MODEL, label: 'Add model…' });

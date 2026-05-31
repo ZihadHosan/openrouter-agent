@@ -45,7 +45,6 @@ export function getModels(): string[] {
     .get<string[]>('models', [
       'z-ai/glm-4.5-air:free',
       'openrouter/owl-alpha',
-      'deepseek/deepseek-v4-flash',
     ]);
   return models.slice(0, 3);
 }

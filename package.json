@@ -2,7 +2,7 @@
   "name": "openrouter-agent",
   "displayName": "OpenRouter Agent",
   "description": "Lightweight AI chat for VS Code and Cursor — Ask, Plan, and Agent modes powered by OpenRouter.",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "publisher": "ZihadHosan",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -98,10 +98,9 @@
           },
           "default": [
             "z-ai/glm-4.5-air:free",
-            "openrouter/owl-alpha",
-            "deepseek/deepseek-v4-flash"
+            "openrouter/owl-alpha"
           ],
-          "markdownDescription": "Fallback models (max 3) when **Auto** is selected in chat.\n\n**API key:** not stored here — use Command Palette → `OpenRouter: Set API Key` (masked, secure storage).",
+          "markdownDescription": "Free fallback models (max 3) when **Auto** is selected in chat. Defaults are free-tier OpenRouter models; add paid models in chat via **Add model…** or replace this list.\n\n**API key:** not stored here — use Command Palette → `OpenRouter: Set API Key` (masked, secure storage).",
           "maxItems": 3,
           "order": 1
         },
