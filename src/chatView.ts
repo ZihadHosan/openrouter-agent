@@ -1188,6 +1188,38 @@ export class ChatViewProvider {
       gap: 14px;
       min-height: 0;
     }
+    .messages-panel {
+      flex: 1;
+      min-height: 0;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+    }
+    .jump-to-bottom {
+      position: absolute;
+      bottom: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 5;
+      font-family: inherit;
+      font-size: 0.78em;
+      font-weight: 500;
+      color: var(--vscode-foreground);
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+      border-radius: 14px;
+      padding: 5px 12px;
+      cursor: pointer;
+      box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+      opacity: 0.95;
+    }
+    .jump-to-bottom:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+      border-color: var(--vscode-focusBorder);
+    }
+    .jump-to-bottom.hidden {
+      display: none;
+    }
     .msg {
       padding: 0;
       border-radius: 8px;
@@ -1746,7 +1778,10 @@ export class ChatViewProvider {
     <button type="button" id="deleteSessionBtn" class="header-btn header-icon-btn-danger" title="Delete chat" aria-label="Delete chat">Del</button>
     <button type="button" id="clearBtn" class="header-btn" title="Clear messages">Clear</button>
   </div>
-  <div id="messages"></div>
+  <div class="messages-panel">
+    <div id="messages"></div>
+    <button type="button" id="jumpToBottomBtn" class="jump-to-bottom hidden" title="Jump to latest">↓ Latest</button>
+  </div>
   <div class="composer-wrap">
     <div class="composer">
       <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — Enter to send, Shift+Enter for new line"></textarea>
@@ -1770,6 +1805,7 @@ export class ChatViewProvider {
     const AUTO_MODEL = '${AUTO_MODEL_ID}';
     const ADD_MODEL = '${addModelOption}';
     const messagesEl = document.getElementById('messages');
+    const jumpToBottomBtn = document.getElementById('jumpToBottomBtn');
     const inputEl = document.getElementById('input');
     const sendBtn = document.getElementById('sendBtn');
     const sendSpinner = document.getElementById('sendSpinner');
@@ -1784,6 +1820,9 @@ export class ChatViewProvider {
     let streamText = '';
     let streamRenderTimer = null;
     const STREAM_RENDER_MS = 80;
+    const SCROLL_BOTTOM_THRESHOLD = 48;
+    let stickToBottom = true;
+    let programmaticScroll = false;
     let approvalPending = false;
     let lastModelId = AUTO_MODEL;
 
@@ -2385,13 +2424,74 @@ export class ChatViewProvider {
       });
     }
 
-    function scrollMessageIntoView(el, block) {
-      if (!el) return;
+    function distanceFromBottom() {
+      return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+    }
+
+    function isNearBottom() {
+      return distanceFromBottom() <= SCROLL_BOTTOM_THRESHOLD;
+    }
+
+    function updateJumpToBottomButton() {
+      if (!jumpToBottomBtn) {
+        return;
+      }
+      const show = !stickToBottom && (processing || !!streamingEl);
+      jumpToBottomBtn.classList.toggle('hidden', !show);
+    }
+
+    function scrollToBottom(force) {
+      if (!force && !stickToBottom) {
+        return;
+      }
+      programmaticScroll = true;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      requestAnimationFrame(function() {
+        requestAnimationFrame(function() {
+          programmaticScroll = false;
+          if (force) {
+            stickToBottom = true;
+          }
+          updateJumpToBottomButton();
+        });
+      });
+    }
+
+    function scrollMessageIntoView(el, block, force) {
+      if (!el) {
+        return;
+      }
+      if (!force && processing && !stickToBottom) {
+        return;
+      }
       const align = block || 'start';
+      programmaticScroll = true;
       requestAnimationFrame(function() {
         requestAnimationFrame(function() {
           el.scrollIntoView({ block: align, behavior: 'auto' });
+          requestAnimationFrame(function() {
+            programmaticScroll = false;
+            if (force) {
+              stickToBottom = true;
+            }
+            updateJumpToBottomButton();
+          });
         });
+      });
+    }
+
+    messagesEl.addEventListener('scroll', function() {
+      if (programmaticScroll) {
+        return;
+      }
+      stickToBottom = isNearBottom();
+      updateJumpToBottomButton();
+    }, { passive: true });
+
+    if (jumpToBottomBtn) {
+      jumpToBottomBtn.addEventListener('click', function() {
+        stickToBottom = true;
+        scrollToBottom(true);
       });
     }
 
@@ -2410,13 +2510,14 @@ export class ChatViewProvider {
       streamingEl = null;
       streamingBody = null;
       streamText = '';
+      updateJumpToBottomButton();
     }
 
     function scrollStreamIntoView() {
       if (!streamingEl) {
         return;
       }
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollToBottom(false);
     }
 
     function morphThinkingToStream() {
@@ -2450,7 +2551,7 @@ export class ChatViewProvider {
         messagesEl.appendChild(streamingEl);
       }
       streamText = '';
-      scrollMessageIntoView(streamingEl, 'start');
+      scrollMessageIntoView(streamingEl, 'start', stickToBottom);
     }
 
     function flushStreamRender() {
@@ -2503,13 +2604,14 @@ export class ChatViewProvider {
         bindMessageLinks(streamingBody);
         wrapTables(streamingBody);
         appendToolDetails(streamingEl, details);
-        scrollMessageIntoView(streamingEl, 'start');
+        scrollMessageIntoView(streamingEl, 'start', stickToBottom);
         streamingEl = null;
         streamingBody = null;
         streamText = '';
         return;
       }
       appendMessage('assistant', content, 'msg-enter', details);
+      updateJumpToBottomButton();
     }
 
     function appendMessage(role, content, extraClass, details) {
@@ -2531,7 +2633,7 @@ export class ChatViewProvider {
         appendToolDetails(div, details);
       }
       messagesEl.appendChild(div);
-      scrollMessageIntoView(div, 'start');
+      scrollMessageIntoView(div, role === 'user' ? 'end' : 'start', role === 'user');
       return div;
     }
 
@@ -2567,7 +2669,7 @@ export class ChatViewProvider {
         renderProcessHtml(completed, current, thought) +
         '</div>';
       messagesEl.appendChild(thinkingEl);
-      scrollMessageIntoView(thinkingEl, 'end');
+      scrollMessageIntoView(thinkingEl, 'end', stickToBottom);
     }
 
     function updateThinking(label, process) {
@@ -2582,7 +2684,7 @@ export class ChatViewProvider {
       if (body) {
         body.innerHTML = renderProcessHtml(completed, current, thought);
       }
-      scrollMessageIntoView(thinkingEl, 'end');
+      scrollMessageIntoView(thinkingEl, 'end', stickToBottom);
     }
 
     function removeThinking(instant) {
@@ -2695,11 +2797,13 @@ export class ChatViewProvider {
         sendSpinner.classList.add('hidden');
         removeThinking(false);
       }
+      updateJumpToBottomButton();
     }
 
     function send() {
       const text = inputEl.value.trim();
       if (!text || processing) return;
+      stickToBottom = true;
       const modelId = getSelectedModelId();
       vscode.postMessage({
         type: 'send',
@@ -2772,16 +2876,19 @@ export class ChatViewProvider {
           }
           break;
         case 'userMessage':
+          stickToBottom = true;
           appendMessage('user', msg.content);
           break;
         case 'assistantStreamStart':
           morphThinkingToStream();
+          updateJumpToBottomButton();
           break;
         case 'assistantPartial':
           updateAssistantPartial(msg.content);
           break;
         case 'assistantStreamCancel':
           cancelAssistantStream();
+          updateJumpToBottomButton();
           break;
         case 'assistantMessage':
           if (msg.finalizeStream && streamingEl) {
@@ -2812,6 +2919,8 @@ export class ChatViewProvider {
           messagesEl.innerHTML = '';
           removeThinking();
           removeStreamUi(true);
+          stickToBottom = true;
+          updateJumpToBottomButton();
           break;
         case 'toolApproval':
           showApprovalCard(msg);
