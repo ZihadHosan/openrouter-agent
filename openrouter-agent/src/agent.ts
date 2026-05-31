@@ -45,18 +45,30 @@ function truncateContent(text: string, max: number): string {
   );
 }
 
-const ASK_SYSTEM = `You are a helpful coding assistant in VS Code. Answer questions clearly and concisely.
-Use provided workspace context when relevant. Format code with markdown fences when helpful.
+const ASK_SYSTEM = `You are a helpful coding assistant in VS Code ASK MODE.
 
-To read or list workspace files, use a JSON tool block (read-only tools run automatically in Ask mode):
+You can read ANY file in the workspace automatically (read-only). Use tools to list or read files when the user asks about them.
+
+Preferred tool format:
 
 \`\`\`agent-tool
 {"tool":"read_file","path":"README.md"}
 \`\`\`
 
-Or: {"tool":"list_files","pattern":"**/*","maxResults":100}
+Tools (read-only, run immediately in Ask mode):
+- read_file — one file: {"tool":"read_file","path":"path/to/file.md"}
+- list_files — find paths: {"tool":"list_files","pattern":"**/*.md","maxResults":200}
+- read_glob — read many files at once: {"tool":"read_glob","pattern":"**/*.md","maxFiles":30}
 
-Do NOT use XML tags like <tool_call>. For writes or terminal commands, tell the user to switch to Agent mode.`;
+IMPORTANT glob rules:
+- Use "**/*.md" to match markdown in ALL subfolders. NEVER use "*.md" alone (root only).
+- To read all markdown files, use read_glob with pattern "**/*.md".
+
+STRICT FILE RULES:
+- NEVER say a file exists or does not exist without a successful tool result in this turn.
+- If unsure, call list_files or read_glob first.
+
+Do NOT use write or terminal tools in Ask mode; tell the user to switch to Agent mode for those.`;
 
 const PLAN_SYSTEM = `You are a planning assistant in VS Code PLAN MODE.
 
@@ -81,12 +93,15 @@ AVAILABLE TOOLS — you MUST use exactly this format (no XML, no other tags):
 \`\`\`
 
 Tools:
-1. list_files — {"tool":"list_files","pattern":"**/*","maxResults":100}
+1. list_files — {"tool":"list_files","pattern":"**/*","maxResults":200}
 2. read_file — {"tool":"read_file","path":"path/to/file"}
-3. propose_write_file — {"tool":"propose_write_file","path":"path","content":"full file text"}
-4. run_command — {"tool":"run_command","command":"npm test","cwd":"optional/subfolder","background":false}
+3. read_glob — {"tool":"read_glob","pattern":"**/*.md","maxFiles":30}  (list + read many files; use **/ for subfolders)
+4. propose_write_file — {"tool":"propose_write_file","path":"path","content":"full file text"}
+5. run_command — {"tool":"run_command","command":"npm test","cwd":"optional/subfolder","background":false}
 
 Rules:
+- Use "**/*.md" not "*.md" when searching subfolders.
+- NEVER claim a file exists or is missing without tool JSON proof.
 - Commands run in the chat terminal. Short commands wait for completion and show Success or Failed.
 - Long-running commands (npm run dev, npm start, watch, serve) auto-run in background unless "background":false.
 - Use "background":true explicitly for dev servers; initial output is captured then the process keeps running.
@@ -116,7 +131,11 @@ export function buildPrompt(
 
 function buildContextBlock(ctx: PromptContext): string {
   const parts: string[] = [];
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   parts.push(`- Workspace: ${ctx.workspaceName}`);
+  if (root) {
+    parts.push(`- Workspace root: ${root}`);
+  }
   if (ctx.activeFilePath) {
     parts.push(`- Active file: ${ctx.activeFilePath}`);
   }

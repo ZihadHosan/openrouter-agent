@@ -13,14 +13,22 @@ import {
   describeProcessStep,
   cleanAssistantVisibleText,
   describeToolCall,
+  buildAutoToolCall,
+  detectUserFileIntent,
   handleToolCall,
   hasToolCallMarkup,
   isReadOnlyTool,
+  mentionsFileExistence,
   parseToolCall,
+  requiresFileVerification,
+  resolveToolCall,
   stripToolBlock,
+  type ToolCall,
 } from './tools';
 
-const MAX_AGENT_ITERATIONS = 8;
+const MAX_AGENT_ITERATIONS = 16;
+const MAX_PARSE_RETRIES = 2;
+const MAX_UNVERIFIED_RETRIES = 2;
 
 /** Single chat UI — one WebviewPanel on the right (no sidebar duplicate). */
 export class ChatViewProvider {
@@ -401,7 +409,7 @@ export class ChatViewProvider {
             '\n\n💡 **Plan mode** does not run tools. Switch to **Agent** (or **Ask** for read-only) to explore files.';
         }
       } else {
-        const out = await this.runToolLoop(conversation, mode === 'agent');
+        const out = await this.runToolLoop(conversation, mode === 'agent', trimmed);
         response = out.content;
         this.history.push({ role: 'assistant', content: response, details: out.details });
         await this.persistSession();
@@ -437,13 +445,38 @@ export class ChatViewProvider {
 
   private async runToolLoop(
     conversation: ChatMessage[],
-    allowWrites: boolean
+    allowWrites: boolean,
+    userText: string
   ): Promise<{ content: string; details: ToolDetailEntry[] }> {
     const displayParts: string[] = [];
     const details: ToolDetailEntry[] = [];
     const completedSteps: string[] = [];
     let lastAssistant = '';
     let stepNum = 0;
+    let toolsRun = 0;
+    let parseRetries = 0;
+    let unverifiedRetries = 0;
+    const needsVerification = requiresFileVerification(userText);
+
+    const autoCall = buildAutoToolCall(detectUserFileIntent(userText));
+    if (autoCall) {
+      const resolved = resolveToolCall(autoCall);
+      stepNum++;
+      const toolStep = describeProcessStep(stepNum, 'tool', resolved);
+      this.updateProcess(completedSteps, toolStep, 'Checking workspace files…');
+      const ran = await this.runOneTool(
+        resolved,
+        '(auto)',
+        conversation,
+        details,
+        completedSteps,
+        stepNum,
+        allowWrites
+      );
+      if (ran) {
+        toolsRun++;
+      }
+    }
 
     for (let i = 0; i < MAX_AGENT_ITERATIONS; i++) {
       stepNum++;
@@ -472,11 +505,64 @@ export class ChatViewProvider {
       }
 
       if (!toolCall) {
+        if (hasToolCallMarkup(raw) && parseRetries < MAX_PARSE_RETRIES) {
+          parseRetries++;
+          completedSteps.push(thinkStep.replace(/…$/, '') + ' — retrying tool…');
+          conversation.push({ role: 'assistant', content: raw });
+          conversation.push({
+            role: 'user',
+            content:
+              'Your tool call could not be parsed. Use exactly:\n```agent-tool\n{"tool":"read_file","path":"relative/path.md"}\n```',
+          });
+          continue;
+        }
+
+        const guessedAboutFiles =
+          needsVerification &&
+          toolsRun === 0 &&
+          (visible || mentionsFileExistence(raw) || hasToolCallMarkup(raw));
+
+        if (guessedAboutFiles && unverifiedRetries < MAX_UNVERIFIED_RETRIES) {
+          unverifiedRetries++;
+          completedSteps.push(thinkStep.replace(/…$/, '') + ' — verifying files…');
+          const fallbackAuto = buildAutoToolCall(detectUserFileIntent(userText));
+          if (fallbackAuto) {
+            const resolved = resolveToolCall(fallbackAuto);
+            stepNum++;
+            const toolStep = describeProcessStep(stepNum, 'tool', resolved);
+            this.updateProcess(completedSteps, toolStep);
+            const ran = await this.runOneTool(
+              resolved,
+              raw,
+              conversation,
+              details,
+              completedSteps,
+              stepNum,
+              allowWrites
+            );
+            if (ran) {
+              toolsRun++;
+              continue;
+            }
+          }
+          conversation.push({ role: 'assistant', content: raw });
+          conversation.push({
+            role: 'user',
+            content:
+              'Do NOT guess about files. You must call read_file, list_files, or read_glob and use the JSON tool result before answering.',
+          });
+          continue;
+        }
+
         completedSteps.push(
           thinkStep.replace(/…$/, '').replace(/\.+$/, '') + ' — done'
         );
-        if (visible) {
+        if (visible && !(needsVerification && toolsRun === 0)) {
           displayParts.push(visible);
+        } else if (needsVerification && toolsRun === 0) {
+          displayParts.push(
+            '_Could not verify files in the workspace. Try again, open the correct folder, or switch models._'
+          );
         } else if (hasToolCallMarkup(raw)) {
           displayParts.push(
             '_Could not run a tool call from the model. Try again or switch models._'
@@ -491,7 +577,7 @@ export class ChatViewProvider {
           displayParts.push(visible);
         }
         displayParts.push(
-          '\n\n💡 **Switch to Agent mode** to write files or run terminal commands.'
+          `\n\n💡 **Ask mode is read-only.** Switch to **Agent mode** to run \`${toolCall.tool}\`.`
         );
         break;
       }
@@ -502,69 +588,19 @@ export class ChatViewProvider {
       const toolStep = describeProcessStep(stepNum, 'tool', toolCall);
       this.updateProcess(completedSteps, toolStep, visible);
 
-      const { result, displayNote } = await handleToolCall(toolCall, {
-        onPropose: () => {
-          /* approval card shown in chat */
-        },
-        requestApproval: (req) => this.approvalBridge.request(req),
-        terminalCallbacks: {
-          onStart: (info) => {
-            this.post({
-              type: 'terminalRunStart',
-              runId: info.runId,
-              command: info.command,
-              cwd: info.cwd,
-              shell: info.shell,
-              background: info.background,
-            });
-          },
-          onOutput: (info) => {
-            this.post({
-              type: 'terminalRunUpdate',
-              runId: info.runId,
-              stdout: info.stdout,
-              stderr: info.stderr,
-            });
-          },
-          onComplete: (run) => {
-            this.post({
-              type: 'terminalRunEnd',
-              runId: run.runId,
-              command: run.command,
-              cwd: run.cwd,
-              shell: run.shell,
-              stdout: run.stdout,
-              stderr: run.stderr,
-              exitCode: run.exitCode,
-              timedOut: run.timedOut,
-              success: run.success,
-              background: run.background,
-              running: run.running,
-            });
-          },
-        },
-        onTerminalOutput: () => {
-          /* terminal UI driven by terminalCallbacks */
-        },
-      });
-
-      const resultPreview =
-        result.length > 6000 ? result.slice(0, 6000) + '\n… [truncated]' : result;
-      details.push({
-        step: stepNum,
-        title: displayNote ?? describeToolCall(toolCall),
-        result: resultPreview,
-      });
-
-      completedSteps.push(
-        describeProcessDone(stepNum, toolCall, displayNote)
+      const ran = await this.runOneTool(
+        toolCall,
+        raw,
+        conversation,
+        details,
+        completedSteps,
+        stepNum,
+        allowWrites
       );
-
-      conversation.push({ role: 'assistant', content: raw });
-      conversation.push({
-        role: 'user',
-        content: `Tool result for ${toolCall.tool}:\n\`\`\`json\n${result}\n\`\`\``,
-      });
+      if (!ran) {
+        break;
+      }
+      toolsRun++;
     }
 
     if (displayParts.length > 0) {
@@ -572,25 +608,126 @@ export class ChatViewProvider {
     }
 
     const fallback = cleanAssistantVisibleText(lastAssistant) || stripToolBlock(lastAssistant);
-    if (fallback) {
+    if (fallback && !(needsVerification && toolsRun === 0)) {
       return { content: fallback, details };
     }
 
     if (details.length > 0) {
-      const content = await this.fetchFinalSummary(conversation, completedSteps);
+      const content = await this.fetchFinalSummary(conversation, completedSteps, needsVerification);
       return { content, details };
     }
 
     return {
       content:
-        '_No response from the model. Check your API key and model, then try again._',
+        needsVerification && toolsRun === 0
+          ? '_Could not verify files in the workspace. Open the correct folder and try again._'
+          : '_No response from the model. Check your API key and model, then try again._',
       details,
     };
   }
 
+  private async runOneTool(
+    toolCall: ToolCall,
+    assistantRaw: string,
+    conversation: ChatMessage[],
+    details: ToolDetailEntry[],
+    completedSteps: string[],
+    stepNum: number,
+    allowWrites: boolean
+  ): Promise<boolean> {
+    if (!toolCall) {
+      return false;
+    }
+
+    if (!allowWrites && !isReadOnlyTool(toolCall.tool)) {
+      return false;
+    }
+
+    const { result, displayNote } = await handleToolCall(toolCall, {
+      onPropose: () => {
+        /* approval card shown in chat */
+      },
+      requestApproval: (req) => this.approvalBridge.request(req),
+      terminalCallbacks: {
+        onStart: (info) => {
+          this.post({
+            type: 'terminalRunStart',
+            runId: info.runId,
+            command: info.command,
+            cwd: info.cwd,
+            shell: info.shell,
+            background: info.background,
+          });
+        },
+        onOutput: (info) => {
+          this.post({
+            type: 'terminalRunUpdate',
+            runId: info.runId,
+            stdout: info.stdout,
+            stderr: info.stderr,
+          });
+        },
+        onComplete: (run) => {
+          this.post({
+            type: 'terminalRunEnd',
+            runId: run.runId,
+            command: run.command,
+            cwd: run.cwd,
+            shell: run.shell,
+            stdout: run.stdout,
+            stderr: run.stderr,
+            exitCode: run.exitCode,
+            timedOut: run.timedOut,
+            success: run.success,
+            background: run.background,
+            running: run.running,
+          });
+        },
+      },
+      onTerminalOutput: () => {
+        /* terminal UI driven by terminalCallbacks */
+      },
+    });
+
+    const resultPreview =
+      result.length > 6000 ? result.slice(0, 6000) + '\n… [truncated]' : result;
+    details.push({
+      step: stepNum,
+      title: displayNote ?? describeToolCall(toolCall),
+      result: resultPreview,
+    });
+
+    completedSteps.push(describeProcessDone(stepNum, toolCall, displayNote));
+
+    if (assistantRaw !== '(auto)') {
+      conversation.push({ role: 'assistant', content: assistantRaw });
+    } else {
+      const autoPayload: Record<string, unknown> = { tool: toolCall.tool };
+      if (toolCall.path) {
+        autoPayload.path = toolCall.path;
+      }
+      if (toolCall.pattern) {
+        autoPayload.pattern = toolCall.pattern;
+      }
+      if (toolCall.maxFiles) {
+        autoPayload.maxFiles = toolCall.maxFiles;
+      }
+      conversation.push({
+        role: 'assistant',
+        content: `\`\`\`agent-tool\n${JSON.stringify(autoPayload)}\n\`\`\``,
+      });
+    }
+    conversation.push({
+      role: 'user',
+      content: `Tool result for ${toolCall.tool}:\n\`\`\`json\n${result}\n\`\`\``,
+    });
+    return true;
+  }
+
   private async fetchFinalSummary(
     conversation: ChatMessage[],
-    completedSteps: string[]
+    completedSteps: string[],
+    needsVerification: boolean
   ): Promise<string> {
     const step = completedSteps.length + 1;
     this.updateProcess(
@@ -604,7 +741,10 @@ export class ChatViewProvider {
       content:
         'You have finished running tools. Reply to the user now with a clear, helpful answer ' +
         'based on everything you read. Use markdown if helpful. ' +
-        'Do NOT call any more tools. Do NOT use XML tool_call tags or agent-tool JSON blocks.',
+        'Do NOT call any more tools. Do NOT use XML tool_call tags or agent-tool JSON blocks.' +
+        (needsVerification
+          ? ' Only claim a file exists or does not exist if the tool JSON results prove it.'
+          : ''),
     });
 
     const raw = await askOpenRouter(conversation, {
