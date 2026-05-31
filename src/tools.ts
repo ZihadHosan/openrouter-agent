@@ -12,6 +12,7 @@ import {
   runCommandInWorkspace,
   type TerminalRunCallbacks,
   type TerminalRunResult,
+  type TerminalRunOptions,
 } from './terminalRunner';
 
 export interface ToolHandlerContext {
@@ -927,7 +928,8 @@ export async function executeRunCommand(
   command: string,
   cwd?: string,
   ctx?: ToolHandlerContext,
-  background?: boolean
+  background?: boolean,
+  signal?: AbortSignal
 ): Promise<string> {
   const root = getWorkspaceRoot();
   if (!root) {
@@ -945,16 +947,16 @@ export async function executeRunCommand(
 
   const runBackground = background ?? isBackgroundCommand(command);
   const callbacks = ctx?.terminalCallbacks;
-  const result = await runCommandInWorkspace(command, workDir, callbacks, {
-    background: runBackground,
-  });
+  const options: TerminalRunOptions = { background: runBackground, signal };
+  const result = await runCommandInWorkspace(command, workDir, callbacks, options);
   ctx?.onTerminalOutput?.(result);
   return formatTerminalResultForAgent(result);
 }
 
 export async function handleToolCall(
   call: ToolCall,
-  ctx: ToolHandlerContext
+  ctx: ToolHandlerContext,
+  signal?: AbortSignal
 ): Promise<{ result: string; needsFollowUp: boolean; displayNote?: string }> {
   switch (call.tool) {
     case 'list_files': {
@@ -1018,7 +1020,7 @@ export async function handleToolCall(
           displayNote: 'Command skipped by user.',
         };
       }
-      const result = await executeRunCommand(call.command, call.cwd, ctx, call.background);
+      const result = await executeRunCommand(call.command, call.cwd, ctx, call.background, signal);
       const note = call.background || isBackgroundCommand(call.command)
         ? `Started in background: ${call.command}`
         : `Ran: ${call.command}`;

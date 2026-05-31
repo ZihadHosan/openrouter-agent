@@ -2,7 +2,7 @@
   "name": "openrouter-agent",
   "displayName": "OpenRouter Agent",
   "description": "Lightweight AI chat for VS Code and Cursor — Ask, Plan, and Agent modes powered by OpenRouter.",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "publisher": "ZihadHosan",
   "license": "MIT",
   "icon": "media/icon.png",

@@ -41,6 +41,8 @@ import {
   type ToolCall,
 } from './tools';
 
+import { stopAllRunningProcesses } from './terminalRunner';
+
 const MAX_AGENT_ITERATIONS = 16;
 const MAX_PARSE_RETRIES = 2;
 const MAX_UNVERIFIED_RETRIES = 2;
@@ -542,6 +544,8 @@ export class ChatViewProvider {
     this.approvalBridge.cancelAll();
     this.cancelStreamUi();
     this.setLoading(true, 'Stopping…');
+    // Stop all running terminal processes
+    stopAllRunningProcesses();
   }
 
   private async callOpenRouter(conversation: ChatMessage[]): Promise<string> {
@@ -919,7 +923,8 @@ export class ChatViewProvider {
         details,
         completedSteps,
         stepNum,
-        allowWrites
+        allowWrites,
+        this.activeAbortController?.signal
       );
       if (ran) {
         toolsRun++;
@@ -1008,7 +1013,8 @@ export class ChatViewProvider {
               details,
               completedSteps,
               stepNum,
-              allowWrites
+              allowWrites,
+              this.activeAbortController?.signal
             );
             if (ran) {
               toolsRun++;
@@ -1065,7 +1071,8 @@ export class ChatViewProvider {
         details,
         completedSteps,
         stepNum,
-        allowWrites
+        allowWrites,
+        this.activeAbortController?.signal
       );
       if (!ran) {
         break;
@@ -1122,7 +1129,8 @@ export class ChatViewProvider {
     details: ToolDetailEntry[],
     completedSteps: string[],
     stepNum: number,
-    allowWrites: boolean
+    allowWrites: boolean,
+    signal?: AbortSignal
   ): Promise<boolean> {
     if (!toolCall) {
       return false;
@@ -1132,6 +1140,12 @@ export class ChatViewProvider {
       return false;
     }
 
+    // Track terminal process for cancellation
+    let processRunId: string | undefined;
+    if (toolCall.tool === 'run_command' && toolCall.command) {
+      processRunId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    }
+
     const { result, displayNote } = await handleToolCall(toolCall, {
       onPropose: () => {
         /* approval card shown in chat */
@@ -1139,6 +1153,11 @@ export class ChatViewProvider {
       requestApproval: (req) => this.approvalBridge.request(req),
       terminalCallbacks: {
         onStart: (info) => {
+          // Track the running process
+          if (processRunId) {
+            // We'll track by runId in the map - but we need to get the actual process
+            // For now, we'll use the runId to correlate
+          }
           this.post({
             type: 'terminalRunStart',
             runId: info.runId,
@@ -1171,12 +1190,18 @@ export class ChatViewProvider {
             background: run.background,
             running: run.running,
           });
+          // Stop tracking process if it's not background
+          if (!run.running && !run.background && processRunId) {
+            // The runId in run.runId should match our processRunId
+            // We track it in chatView's map for cancellation
+            // This will be handled by the runCommandInWorkspace signal handling
+          }
         },
       },
       onTerminalOutput: () => {
         /* terminal UI driven by terminalCallbacks */
       },
-    });
+    }, signal);
 
     const resultPreview =
       result.length > 6000 ? result.slice(0, 6000) + '\n… [truncated]' : result;

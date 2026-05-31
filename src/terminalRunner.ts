@@ -3,6 +3,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
+// Track running processes for cancellation
+const runningProcesses = new Map<string, ChildProcess>();
+
 const MAX_OUTPUT_CHARS = 48_000;
 const COMMAND_TIMEOUT_MS = 120_000;
 const BACKGROUND_INITIAL_MS = 8_000;
@@ -61,6 +64,7 @@ export interface TerminalRunCallbacks {
 export interface TerminalRunOptions {
   background?: boolean;
   runId?: string;
+  signal?: AbortSignal;
 }
 
 interface ShellSpec {
@@ -421,18 +425,21 @@ function emitOutput(
   });
 }
 
+interface RunProcessOptions {
+  runId: string;
+  command: string;
+  cwd: string;
+  shellDisplay: string;
+  background: boolean;
+  callbacks?: TerminalRunCallbacks;
+  signal?: AbortSignal;
+}
+
 function runProcess(
   proc: ChildProcess,
-  meta: {
-    runId: string;
-    command: string;
-    cwd: string;
-    shellDisplay: string;
-    background: boolean;
-    callbacks?: TerminalRunCallbacks;
-  }
+  meta: RunProcessOptions
 ): Promise<TerminalRunResult | null> {
-  const { runId, command, cwd, shellDisplay, background, callbacks } = meta;
+  const { runId, command, cwd, shellDisplay, background, callbacks, signal } = meta;
 
   return new Promise((resolve) => {
     let stdout = '';
@@ -441,6 +448,22 @@ function runProcess(
     let spawnFailed = false;
     let agentResolved = false;
     let backgroundReported = false;
+
+    // Track running process for cancellation
+    if (!background) {
+      runningProcesses.set(runId, proc);
+    }
+
+    // Handle abort signal
+    let abortHandler: (() => void) | undefined;
+    if (signal) {
+      abortHandler = () => {
+        if (!agentResolved && proc.exitCode === null) {
+          proc.kill();
+        }
+      };
+      signal.addEventListener('abort', abortHandler);
+    }
 
     callbacks?.onStart?.({ runId, command, cwd, shell: shellDisplay, background });
 
@@ -503,6 +526,10 @@ function runProcess(
       if (initialTimer) {
         clearTimeout(initialTimer);
       }
+      if (abortHandler && signal) {
+        signal.removeEventListener('abort', abortHandler);
+      }
+      runningProcesses.delete(runId);
       spawnFailed = true;
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         const cwdErr = validateCwd(cwd);
@@ -553,6 +580,10 @@ function runProcess(
       if (initialTimer) {
         clearTimeout(initialTimer);
       }
+      if (abortHandler && signal) {
+        signal.removeEventListener('abort', abortHandler);
+      }
+      runningProcesses.delete(runId);
       if (spawnFailed) {
         return;
       }
@@ -595,7 +626,7 @@ function runWithShell(
   cwd: string,
   env: NodeJS.ProcessEnv,
   callbacks: TerminalRunCallbacks | undefined,
-  options: TerminalRunOptions
+  options: TerminalRunOptions & { signal?: AbortSignal }
 ): Promise<TerminalRunResult | null> {
   const runId = options.runId ?? generateRunId();
   const background = options.background ?? false;
@@ -619,6 +650,7 @@ function runWithShell(
     shellDisplay,
     background,
     callbacks,
+    signal: options.signal,
   });
 }
 
@@ -627,7 +659,7 @@ function runWithSystemShell(
   cwd: string,
   env: NodeJS.ProcessEnv,
   callbacks: TerminalRunCallbacks | undefined,
-  options: TerminalRunOptions
+  options: TerminalRunOptions & { signal?: AbortSignal }
 ): Promise<TerminalRunResult | null> {
   const runId = options.runId ?? generateRunId();
   const background = options.background ?? false;
@@ -653,6 +685,7 @@ function runWithSystemShell(
     shellDisplay,
     background,
     callbacks,
+    signal: options.signal,
   });
 }
 
@@ -764,4 +797,27 @@ export function getShellDescription(): string {
     return `${resolveShellExecutable()} → system (shell:true)`;
   }
   return `${candidates.map((c) => c.executable).join(' → ')} → system (shell:true)`;
+}
+
+/**
+ * Stop all running terminal processes.
+ * Returns count of processes that were stopped.
+ */
+export function stopAllRunningProcesses(): number {
+  let count = 0;
+  for (const [runId, proc] of runningProcesses.entries()) {
+    if (proc.exitCode === null) {
+      proc.kill();
+      count++;
+    }
+    runningProcesses.delete(runId);
+  }
+  return count;
+}
+
+/**
+ * Get count of currently running (non-background) processes.
+ */
+export function getRunningProcessCount(): number {
+  return runningProcesses.size;
 }
