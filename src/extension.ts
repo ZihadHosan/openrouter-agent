@@ -1,16 +1,27 @@
 import * as vscode from 'vscode';
 import { AttachmentStore } from './attachments';
 import { ApiKeyStore } from './apiKeyStore';
-import { buildPrompt, gatherContext } from './agent';
+import { buildPrompt, gatherContext, prefetchContext } from './agent';
 import { ChatHistoryStore } from './chatHistory';
 import { ChatViewProvider } from './chatView';
 import { ModelStore } from './models';
 import { askOpenRouter } from './openrouter';
 import { promptPermissionMode } from './permissions';
+import { getWorkspaceIndexer } from './workspaceIndexer';
 let chatProvider: ChatViewProvider;
 let modelStore: ModelStore;
 let apiKeyStore: ApiKeyStore;
 let attachmentStore: AttachmentStore;
+
+/**
+ * Prefetch context data in background for faster first response
+ */
+function backgroundPrefetch(): void {
+  // Small delay to allow extension to fully activate
+  setTimeout(() => {
+    void prefetchContext();
+  }, 2000);
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   modelStore = new ModelStore(context);
@@ -28,6 +39,12 @@ export function activate(context: vscode.ExtensionContext): void {
   void apiKeyStore.migrateFromSettingsIfNeeded();
 
   chatProvider.refreshWebviewIfOpen();
+
+  // Start workspace indexing in background for faster search
+  void getWorkspaceIndexer().startIndexing();
+
+  // Prefetch context in background for faster first response
+  backgroundPrefetch();
 
   const chatStatusBar = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,

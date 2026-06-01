@@ -28,20 +28,33 @@ import {
   cleanAssistantVisibleText,
   describeToolCall,
   buildAutoToolCall,
+  buildAutoToolCalls,
+  canParallelizeReadTools,
   detectUserFileIntent,
+  executeReadToolsInParallel,
+  FILE_ACCESS_REFUSAL_RETRY_PROMPT,
   handleToolCall,
   hasToolCallMarkup,
+  hasToolInterruptionArtifact,
   isReadOnlyTool,
+  mentionsFileAccessRefusal,
   mentionsFileExistence,
+  parseAllToolCalls,
   parseToolCall,
   requiresFileVerification,
   resolveToolCall,
+  shouldSuppressVisibleAsFinal,
   stripToolBlock,
   sanitizeModelOutput,
+  TOOL_INTERRUPTION_RETRY_PROMPT,
+  clearToolResultCache,
   type ToolCall,
 } from './tools';
 
 import { stopAllRunningProcesses } from './terminalRunner';
+import { PerfSpan } from './perf';
+
+const STREAM_POST_THROTTLE_MS = 100;
 
 const MAX_AGENT_ITERATIONS = 16;
 const MAX_PARSE_RETRIES = 2;
@@ -200,6 +213,9 @@ export class ChatViewProvider {
 
   async focus(): Promise<void> {
     await this.openPanelOnRight();
+    // Prefetch context when panel is revealed
+    const { prefetchContext } = await import('./agent');
+    void prefetchContext();
   }
 
   private async handleWebviewMessage(msg: {
@@ -264,6 +280,7 @@ export class ChatViewProvider {
         break;
       case 'clear':
         this.history = [];
+        clearToolResultCache();
         await this.persistSession();
         this.post({ type: 'cleared' });
         break;
@@ -271,6 +288,7 @@ export class ChatViewProvider {
         if (this.processing) {
           break;
         }
+        clearToolResultCache();
         await this.persistSession();
         this.applySessionToUi(await this.historyStore.newSession());
         break;
@@ -278,6 +296,7 @@ export class ChatViewProvider {
         if (this.processing) {
           break;
         }
+        clearToolResultCache();
         const id = String(msg.sessionId ?? '');
         await this.persistSession();
         const session = await this.historyStore.switchSession(id);
@@ -568,25 +587,71 @@ export class ChatViewProvider {
     }
 
     let streamStarted = false;
+    let lastPostAt = 0;
+    let pendingContent = '';
+    let throttleTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const flushPartial = (): void => {
+      if (!pendingContent) {
+        return;
+      }
+      if (!streamStarted) {
+        streamStarted = true;
+        this.streamActiveForUi = true;
+        this.post({ type: 'assistantStreamStart' });
+      }
+      this.post({ type: 'assistantPartial', content: pendingContent });
+      lastPostAt = Date.now();
+      pendingContent = '';
+    };
+
+    const schedulePartial = (content: string): void => {
+      pendingContent = content;
+      const elapsed = Date.now() - lastPostAt;
+      if (elapsed >= STREAM_POST_THROTTLE_MS) {
+        if (throttleTimer) {
+          clearTimeout(throttleTimer);
+          throttleTimer = undefined;
+        }
+        flushPartial();
+        return;
+      }
+      if (throttleTimer) {
+        return;
+      }
+      throttleTimer = setTimeout(() => {
+        throttleTimer = undefined;
+        flushPartial();
+      }, STREAM_POST_THROTTLE_MS - elapsed);
+    };
+
+    const apiSpan = new PerfSpan('apiRequest');
+    let firstTokenLogged = false;
+
     const result = await askOpenRouter(conversation, {
       ...this.routerOptions(),
       stream: true,
       onChunk: (_delta, accumulated) => {
-        let content = sanitizeModelOutput(accumulated);
-        if (this.stripToolLeaksInStream) {
-          content = stripToolBlock(content);
-        }
+        // Never stream raw tool JSON to the chat — only user-visible prose
+        const content = cleanAssistantVisibleText(sanitizeModelOutput(accumulated));
         if (!content) {
           return;
         }
-        if (!streamStarted) {
-          streamStarted = true;
-          this.streamActiveForUi = true;
-          this.post({ type: 'assistantStreamStart' });
+        if (!firstTokenLogged) {
+          firstTokenLogged = true;
+          apiSpan.end('→ first token');
         }
-        this.post({ type: 'assistantPartial', content });
+        schedulePartial(content);
       },
     });
+
+    if (throttleTimer) {
+      clearTimeout(throttleTimer);
+      throttleTimer = undefined;
+    }
+    if (pendingContent) {
+      flushPartial();
+    }
 
     if (!streamStarted) {
       this.streamActiveForUi = false;
@@ -595,6 +660,9 @@ export class ChatViewProvider {
     let finalText = sanitizeModelOutput(result);
     if (this.stripToolLeaksInStream) {
       finalText = stripToolBlock(finalText);
+    }
+    if (!firstTokenLogged) {
+      apiSpan.end('→ complete (no stream chunks)');
     }
     return finalText;
   }
@@ -711,7 +779,9 @@ export class ChatViewProvider {
     this.processing = true;
     this.mode = mode;
     this.hasVisionInRequest = hasVisionAttachments(committed);
-    this.stripToolLeaksInStream = committed.length > 0;
+    // Strip tool markup from streamed tokens in Ask/Agent (models like owl-alpha emit many blocks)
+    this.stripToolLeaksInStream =
+      committed.length > 0 || mode === 'ask' || mode === 'agent';
     this.beginRequest();
 
     const userMsg: ChatSessionMessage = {
@@ -759,7 +829,11 @@ export class ChatViewProvider {
     });
 
     try {
+      this.updateProcess([], 'Gathering context…', 'Reading workspace and editor state…');
+      const contextSpan = new PerfSpan('contextGather');
       const context = await gatherContext();
+      contextSpan.end(context.incomplete ? '(incomplete)' : undefined);
+
       const apiHistory: ChatMessage[] = [];
       for (const m of this.history.slice(0, -1)) {
         if (m.role === 'user' && m.attachments?.length) {
@@ -910,9 +984,25 @@ export class ChatViewProvider {
     let unverifiedRetries = 0;
     const needsVerification = requiresFileVerification(userText, { hasAttachments });
 
-    const autoCall = hasAttachments ? null : buildAutoToolCall(detectUserFileIntent(userText));
-    if (autoCall && !this.isAborted()) {
-      const resolved = resolveToolCall(autoCall);
+    const autoCalls = hasAttachments ? [] : buildAutoToolCalls(detectUserFileIntent(userText));
+    if (autoCalls.length >= 2 && canParallelizeReadTools(autoCalls) && !this.isAborted()) {
+      const resolvedBatch = autoCalls.map((c) => resolveToolCall(c));
+      stepNum++;
+      const batchStep = `Step ${stepNum}: Reading ${resolvedBatch.length} project files…`;
+      this.updateProcess(completedSteps, batchStep, 'Checking project files…');
+      const ran = await this.runReadToolsInParallel(
+        resolvedBatch,
+        '(auto)',
+        conversation,
+        details,
+        completedSteps,
+        stepNum
+      );
+      if (ran) {
+        toolsRun += resolvedBatch.length;
+      }
+    } else if (autoCalls.length === 1 && !this.isAborted()) {
+      const resolved = resolveToolCall(autoCalls[0]);
       stepNum++;
       const toolStep = describeProcessStep(stepNum, 'tool', resolved);
       this.updateProcess(completedSteps, toolStep, 'Checking workspace files…');
@@ -968,18 +1058,27 @@ export class ChatViewProvider {
         return { content: raw, details };
       }
 
-      const toolCall = parseToolCall(raw);
+      const toolCalls = parseAllToolCalls(raw);
+      const hasTools = toolCalls.length > 0;
       const visible = cleanAssistantVisibleText(raw);
 
-      if (toolCall) {
+      if (hasTools) {
         this.cancelStreamUi();
       }
 
-      if (visible && toolCall) {
+      if (visible && hasTools) {
         this.updateProcess(completedSteps, thinkStep.replace(/…$/, '') + '…', visible);
       }
 
-      if (!toolCall) {
+      if (!hasTools) {
+        if (hasToolInterruptionArtifact(raw) && parseRetries < MAX_PARSE_RETRIES) {
+          parseRetries++;
+          completedSteps.push(thinkStep.replace(/…$/, '') + ' — retrying tool format…');
+          conversation.push({ role: 'assistant', content: raw });
+          conversation.push({ role: 'user', content: TOOL_INTERRUPTION_RETRY_PROMPT });
+          continue;
+        }
+
         if (hasToolCallMarkup(raw) && parseRetries < MAX_PARSE_RETRIES) {
           parseRetries++;
           completedSteps.push(thinkStep.replace(/…$/, '') + ' — retrying tool…');
@@ -989,6 +1088,57 @@ export class ChatViewProvider {
             content:
               'Your tool call could not be parsed. Use exactly:\n```agent-tool\n{"tool":"read_file","path":"relative/path.md"}\n```',
           });
+          continue;
+        }
+
+        if (
+          toolsRun === 0 &&
+          needsVerification &&
+          mentionsFileAccessRefusal(raw) &&
+          unverifiedRetries < MAX_UNVERIFIED_RETRIES
+        ) {
+          unverifiedRetries++;
+          completedSteps.push(thinkStep.replace(/…$/, '') + ' — retrying after file-access refusal…');
+          const refusalAuto = buildAutoToolCalls(detectUserFileIntent(userText));
+          if (refusalAuto.length >= 2 && canParallelizeReadTools(refusalAuto)) {
+            const resolvedBatch = refusalAuto.map((c) => resolveToolCall(c));
+            stepNum++;
+            const batchStep = describeProcessStep(stepNum, 'tool', resolvedBatch[0]);
+            this.updateProcess(completedSteps, batchStep);
+            const ran = await this.runReadToolsInParallel(
+              resolvedBatch,
+              raw,
+              conversation,
+              details,
+              completedSteps,
+              stepNum
+            );
+            if (ran) {
+              toolsRun += resolvedBatch.length;
+              continue;
+            }
+          } else if (refusalAuto.length === 1) {
+            const resolved = resolveToolCall(refusalAuto[0]);
+            stepNum++;
+            const toolStep = describeProcessStep(stepNum, 'tool', resolved);
+            this.updateProcess(completedSteps, toolStep);
+            const ran = await this.runOneTool(
+              resolved,
+              raw,
+              conversation,
+              details,
+              completedSteps,
+              stepNum,
+              allowWrites,
+              this.activeAbortController?.signal
+            );
+            if (ran) {
+              toolsRun++;
+              continue;
+            }
+          }
+          conversation.push({ role: 'assistant', content: raw });
+          conversation.push({ role: 'user', content: FILE_ACCESS_REFUSAL_RETRY_PROMPT });
           continue;
         }
 
@@ -1033,7 +1183,15 @@ export class ChatViewProvider {
         completedSteps.push(
           thinkStep.replace(/…$/, '').replace(/\.+$/, '') + ' — done'
         );
-        if (visible && !(needsVerification && toolsRun === 0)) {
+        const suppressVisible = shouldSuppressVisibleAsFinal(visible, raw, {
+          needsVerification,
+          toolsRun,
+        });
+        if (
+          visible &&
+          !(needsVerification && toolsRun === 0) &&
+          !suppressVisible
+        ) {
           displayParts.push(visible);
         } else if (needsVerification && toolsRun === 0) {
           displayParts.push(
@@ -1047,37 +1205,88 @@ export class ChatViewProvider {
         break;
       }
 
-      if (!allowWrites && !isReadOnlyTool(toolCall.tool)) {
+      const hasWriteTool = toolCalls.some((c) => !isReadOnlyTool(c.tool));
+      if (!allowWrites && hasWriteTool) {
         completedSteps.push(thinkStep.replace(/…$/, '') + ' — done');
         if (visible) {
           displayParts.push(visible);
         }
+        const blocked = toolCalls.find((c) => !isReadOnlyTool(c.tool));
         displayParts.push(
-          `\n\n💡 **Ask mode is read-only.** Switch to **Agent mode** to run \`${toolCall.tool}\`.`
+          `\n\n💡 **Ask mode is read-only.** Switch to **Agent mode** to run \`${blocked?.tool ?? 'write/command tools'}\`.`
         );
         break;
       }
 
       completedSteps.push(thinkStep.replace(/…$/, '') + ' — done');
 
-      stepNum++;
-      const toolStep = describeProcessStep(stepNum, 'tool', toolCall);
-      this.updateProcess(completedSteps, toolStep, visible);
+      if (canParallelizeReadTools(toolCalls)) {
+        stepNum++;
+        const batchStep = `Step ${stepNum}: Reading ${toolCalls.length} files in parallel…`;
+        this.updateProcess(completedSteps, batchStep, visible);
 
-      const ran = await this.runOneTool(
-        toolCall,
-        raw,
-        conversation,
-        details,
-        completedSteps,
-        stepNum,
-        allowWrites,
-        this.activeAbortController?.signal
-      );
-      if (!ran) {
-        break;
+        const ran = await this.runReadToolsInParallel(
+          toolCalls,
+          raw,
+          conversation,
+          details,
+          completedSteps,
+          stepNum
+        );
+        if (!ran) {
+          break;
+        }
+        toolsRun += toolCalls.length;
+      } else if (toolCalls.length > 1) {
+        conversation.push({ role: 'assistant', content: raw });
+        let ranAny = false;
+        for (const tc of toolCalls) {
+          if (!allowWrites && !isReadOnlyTool(tc.tool)) {
+            continue;
+          }
+          stepNum++;
+          const toolStep = describeProcessStep(stepNum, 'tool', tc);
+          this.updateProcess(completedSteps, toolStep);
+          const ran = await this.runOneTool(
+            tc,
+            raw,
+            conversation,
+            details,
+            completedSteps,
+            stepNum,
+            allowWrites,
+            this.activeAbortController?.signal,
+            { skipAssistantPush: true }
+          );
+          if (ran) {
+            ranAny = true;
+            toolsRun++;
+          }
+        }
+        if (!ranAny) {
+          break;
+        }
+      } else {
+        const toolCall = toolCalls[0];
+        stepNum++;
+        const toolStep = describeProcessStep(stepNum, 'tool', toolCall);
+        this.updateProcess(completedSteps, toolStep, visible);
+
+        const ran = await this.runOneTool(
+          toolCall,
+          raw,
+          conversation,
+          details,
+          completedSteps,
+          stepNum,
+          allowWrites,
+          this.activeAbortController?.signal
+        );
+        if (!ran) {
+          break;
+        }
+        toolsRun++;
       }
-      toolsRun++;
 
       if (this.isAborted()) {
         return { content: STOPPED_MESSAGE, details };
@@ -1122,6 +1331,42 @@ export class ChatViewProvider {
     };
   }
 
+  private async runReadToolsInParallel(
+    toolCalls: ToolCall[],
+    assistantRaw: string,
+    conversation: ChatMessage[],
+    details: ToolDetailEntry[],
+    completedSteps: string[],
+    stepNum: number
+  ): Promise<boolean> {
+    if (toolCalls.length < 2) {
+      return false;
+    }
+
+    const results = await executeReadToolsInParallel(toolCalls);
+
+    conversation.push({ role: 'assistant', content: assistantRaw });
+
+    for (const { tool, result, displayNote } of results) {
+      const resultPreview =
+        result.length > 6000 ? result.slice(0, 6000) + '\n… [truncated]' : result;
+      details.push({
+        step: stepNum,
+        title: displayNote ?? describeToolCall(tool),
+        result: resultPreview,
+      });
+      conversation.push({
+        role: 'user',
+        content: `Tool result for ${tool.tool}:\n\`\`\`json\n${result}\n\`\`\``,
+      });
+    }
+
+    completedSteps.push(
+      describeProcessDone(stepNum, toolCalls[0], `Read ${results.length} files in parallel`)
+    );
+    return true;
+  }
+
   private async runOneTool(
     toolCall: ToolCall,
     assistantRaw: string,
@@ -1130,7 +1375,8 @@ export class ChatViewProvider {
     completedSteps: string[],
     stepNum: number,
     allowWrites: boolean,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options?: { skipAssistantPush?: boolean }
   ): Promise<boolean> {
     if (!toolCall) {
       return false;
@@ -1213,23 +1459,25 @@ export class ChatViewProvider {
 
     completedSteps.push(describeProcessDone(stepNum, toolCall, displayNote));
 
-    if (assistantRaw !== '(auto)') {
-      conversation.push({ role: 'assistant', content: assistantRaw });
-    } else {
-      const autoPayload: Record<string, unknown> = { tool: toolCall.tool };
-      if (toolCall.path) {
-        autoPayload.path = toolCall.path;
+    if (!options?.skipAssistantPush) {
+      if (assistantRaw !== '(auto)') {
+        conversation.push({ role: 'assistant', content: assistantRaw });
+      } else {
+        const autoPayload: Record<string, unknown> = { tool: toolCall.tool };
+        if (toolCall.path) {
+          autoPayload.path = toolCall.path;
+        }
+        if (toolCall.pattern) {
+          autoPayload.pattern = toolCall.pattern;
+        }
+        if (toolCall.maxFiles) {
+          autoPayload.maxFiles = toolCall.maxFiles;
+        }
+        conversation.push({
+          role: 'assistant',
+          content: `\`\`\`agent-tool\n${JSON.stringify(autoPayload)}\n\`\`\``,
+        });
       }
-      if (toolCall.pattern) {
-        autoPayload.pattern = toolCall.pattern;
-      }
-      if (toolCall.maxFiles) {
-        autoPayload.maxFiles = toolCall.maxFiles;
-      }
-      conversation.push({
-        role: 'assistant',
-        content: `\`\`\`agent-tool\n${JSON.stringify(autoPayload)}\n\`\`\``,
-      });
     }
     conversation.push({
       role: 'user',
@@ -1306,6 +1554,12 @@ export class ChatViewProvider {
     const markedUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, 'media', 'marked.min.js')
     );
+    const hljsUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'highlight.min.js')
+    );
+    const highlightCssUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.extensionUri, 'media', 'highlight-vscode.css')
+    );
     const chatFontSize = this.getChatFontSize();
     const fontSizeCss =
       chatFontSize > 0 ? `${chatFontSize}px` : '14px';
@@ -1313,9 +1567,10 @@ export class ChatViewProvider {
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob: ${webview.cspSource}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' ${webview.cspSource};" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob: ${webview.cspSource}; style-src 'unsafe-inline' ${webview.cspSource}; script-src 'nonce-${nonce}' ${webview.cspSource};" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OpenRouter Chat</title>
+  <link rel="stylesheet" href="${highlightCssUri}" />
   <style>
     :root {
       --chat-font-size: ${fontSizeCss};
@@ -1891,6 +2146,106 @@ export class ChatViewProvider {
       border-radius: 4px;
       letter-spacing: normal;
     }
+    .msg.assistant .msg-body .code-editor-block {
+      --code-block-bg: color-mix(in srgb, var(--vscode-foreground) 5%, var(--chat-surface));
+      --code-block-border: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+      margin: 0.75em 0;
+      border: 1px solid var(--code-block-border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--code-block-bg);
+      font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+      font-size: var(--vscode-editor-font-size, 13px);
+      line-height: 1.5;
+    }
+    .msg.assistant .msg-body .code-editor-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 8px 4px 12px;
+      background: var(--code-block-bg);
+      font-size: 0.78em;
+      user-select: none;
+    }
+    .msg.assistant .msg-body .code-editor-lang {
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+      text-transform: lowercase;
+      opacity: 0.85;
+    }
+    .msg.assistant .msg-body .code-editor-copy {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      flex-shrink: 0;
+      color: var(--vscode-foreground);
+      opacity: 0.65;
+      background: transparent;
+      border: none;
+      padding: 0;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .msg.assistant .msg-body .code-editor-copy svg {
+      width: 16px;
+      height: 16px;
+    }
+    .msg.assistant .msg-body .code-editor-copy:hover {
+      opacity: 1;
+      background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+    }
+    .msg.assistant .msg-body .code-editor-copy .code-editor-check-icon {
+      display: none;
+      color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #73c991));
+    }
+    .msg.assistant .msg-body .code-editor-copy.copied .code-editor-copy-icon {
+      display: none;
+    }
+    .msg.assistant .msg-body .code-editor-copy.copied .code-editor-check-icon {
+      display: block;
+    }
+    .msg.assistant .msg-body .code-editor-copy.copied {
+      opacity: 1;
+    }
+    .msg.assistant .msg-body .code-editor-scroll {
+      overflow-x: auto;
+      max-width: 100%;
+      padding: 4px 0 8px;
+      background: var(--code-block-bg);
+    }
+    .msg.assistant .msg-body .code-editor-table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    .msg.assistant .msg-body .code-editor-gutter {
+      width: 3em;
+      min-width: 3em;
+      padding: 0 10px 0 8px;
+      text-align: right;
+      vertical-align: top;
+      color: var(--vscode-editorLineNumber-foreground, var(--vscode-descriptionForeground));
+      background: transparent;
+      user-select: none;
+      opacity: 0.55;
+      white-space: nowrap;
+    }
+    .msg.assistant .msg-body .code-editor-line {
+      padding: 0 12px 0 0;
+      vertical-align: top;
+      white-space: pre;
+      width: 100%;
+    }
+    .msg.assistant .msg-body .code-editor-line code {
+      font-family: inherit;
+      font-size: inherit;
+      background: transparent;
+      border: none;
+      padding: 0;
+      white-space: pre;
+    }
     .msg-body pre,
     .msg pre {
       font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
@@ -2275,10 +2630,9 @@ export class ChatViewProvider {
       </div>
     </div>
   </div>
+  <script src="${hljsUri}"></script>
   <script src="${markedUri}"></script>
   <script nonce="${nonce}">
-    marked.use({ breaks: true, gfm: true });
-
     const vscode = acquireVsCodeApi();
     const AUTO_MODEL = '${AUTO_MODEL_ID}';
     const ADD_MODEL = '${addModelOption}';
@@ -2636,6 +2990,64 @@ export class ChatViewProvider {
       return d.innerHTML;
     }
 
+    function renderCodeEditorBlock(code, lang) {
+      var language = (lang || 'plaintext').trim().toLowerCase();
+      var langLabel = language || 'plaintext';
+      if (language === 'text') {
+        language = 'plaintext';
+        langLabel = 'plaintext';
+      }
+      var lines = String(code).replace(/\\r\\n/g, '\\n').split('\\n');
+      var rows = lines.map(function(line, i) {
+        var highlighted;
+        try {
+          if (language !== 'plaintext' && typeof hljs !== 'undefined' && hljs.getLanguage(language)) {
+            highlighted = hljs.highlight(line || ' ', { language: language }).value;
+          } else {
+            highlighted = escapeHtml(line || ' ');
+          }
+        } catch (e) {
+          highlighted = escapeHtml(line || ' ');
+        }
+        return '<tr><td class="code-editor-gutter">' + (i + 1) + '</td>' +
+          '<td class="code-editor-line"><code class="hljs">' + highlighted + '</code></td></tr>';
+      }).join('');
+      var encoded = encodeURIComponent(String(code));
+      var copyBtn =
+        '<button type="button" class="code-editor-copy" title="Copy code" aria-label="Copy code">' +
+        '<svg class="code-editor-copy-icon" viewBox="0 0 16 16" aria-hidden="true">' +
+        '<rect x="5" y="5" width="9" height="9" rx="1" fill="none" stroke="currentColor" stroke-width="1.25"/>' +
+        '<path d="M4 11V3a1 1 0 011-1h6" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>' +
+        '</svg>' +
+        '<svg class="code-editor-check-icon" viewBox="0 0 16 16" aria-hidden="true">' +
+        '<path d="M3.5 8.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>' +
+        '</svg>' +
+        '</button>';
+      return '<div class="code-editor-block" data-lang="' + escapeHtml(langLabel) + '" data-code="' + encoded + '">' +
+        '<div class="code-editor-header">' +
+        '<span class="code-editor-lang">' + escapeHtml(langLabel) + '</span>' +
+        copyBtn +
+        '</div>' +
+        '<div class="code-editor-scroll">' +
+        '<table class="code-editor-table"><tbody>' + rows + '</tbody></table>' +
+        '</div></div>';
+    }
+
+    marked.use({
+      breaks: true,
+      gfm: true,
+      renderer: {
+        code: function(token) {
+          var text = token.text;
+          var lang = token.lang;
+          if (typeof text !== 'string') {
+            text = String(text);
+          }
+          return renderCodeEditorBlock(text, lang);
+        }
+      }
+    });
+
     function isPipeRow(line) {
       return /^\\|.+\\|$/.test(line.trim());
     }
@@ -2739,6 +3151,38 @@ export class ChatViewProvider {
         vscode.postMessage({ type: 'openLink', url: anchor.href });
       });
     }
+
+    messagesEl.addEventListener('click', (e) => {
+      const btn = e.target.closest('.code-editor-copy');
+      if (!btn) return;
+      const block = btn.closest('.code-editor-block');
+      if (!block) return;
+      e.preventDefault();
+      var raw = '';
+      try {
+        raw = decodeURIComponent(block.getAttribute('data-code') || '');
+      } catch (err) {
+        raw = '';
+      }
+      if (!raw) {
+        return;
+      }
+      if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        return;
+      }
+      navigator.clipboard.writeText(raw).then(function() {
+        btn.classList.add('copied');
+        btn.setAttribute('title', 'Copied');
+        btn.setAttribute('aria-label', 'Copied');
+        setTimeout(function() {
+          btn.classList.remove('copied');
+          btn.setAttribute('title', 'Copy code');
+          btn.setAttribute('aria-label', 'Copy code');
+        }, 1500);
+      }).catch(function() {
+        /* clipboard denied */
+      });
+    });
 
     function appendToolDetails(parent, details) {
       if (!details || !details.length) return;
@@ -3074,14 +3518,23 @@ export class ChatViewProvider {
         return;
       }
       streamRenderTimer = null;
-      streamingBody.innerHTML = formatContent(streamText, 'assistant');
-      var cursor = document.createElement('span');
-      cursor.className = 'stream-cursor';
-      cursor.textContent = '▍';
-      streamingBody.appendChild(cursor);
-      bindMessageLinks(streamingBody);
-      wrapTables(streamingBody);
-      scrollStreamIntoView();
+      var body = streamingBody;
+      var text = streamText;
+      var doRender = function() {
+        body.innerHTML = formatContent(text, 'assistant');
+        var cursor = document.createElement('span');
+        cursor.className = 'stream-cursor';
+        cursor.textContent = '▍';
+        body.appendChild(cursor);
+        bindMessageLinks(body);
+        wrapTables(body);
+        scrollStreamIntoView();
+      };
+      if (prefersReducedMotion()) {
+        doRender();
+      } else {
+        requestAnimationFrame(doRender);
+      }
     }
 
     function scheduleStreamRender() {

@@ -182,7 +182,17 @@ async function readJsonCompletion(response: Response): Promise<string> {
   return content;
 }
 
-export async function askOpenRouter(
+// Maximum number of retry attempts (including initial attempt)
+const MAX_RETRY_ATTEMPTS = 3;
+
+// Base delay in milliseconds for exponential backoff
+const BACKOFF_BASE_MS = 500;
+
+/**
+ * Ask OpenRouter with model fallback on error
+ * Automatically retries with alternate models when using Auto mode
+ */
+export async function askOpenRouterWithFallback(
   messages: ChatMessage[],
   options: AskOpenRouterOptions
 ): Promise<string> {
@@ -194,6 +204,81 @@ export async function askOpenRouter(
     );
   }
 
+  const useStream = !!(options.stream && options.onChunk);
+  let lastError: string | undefined;
+
+  // Try up to MAX_RETRY_ATTEMPTS times with different models
+  for (let attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
+    // If this is a retry, try a different model
+    let currentMessages = messages;
+    let currentOptions = { ...options };
+
+    if (attempt > 0 && options.modelStore) {
+      // Get available models and try alternate ones
+      const available = options.modelStore.getAvailableModels() ?? getModels();
+      const currentModel = options.modelStore.getSelectedModelId();
+
+      if (currentModel === AUTO_MODEL_ID && available.length > 1) {
+        // For Auto mode, pick a different model for retry
+        // Skip models we've already tried (simple approach: use index offset)
+        const retryIndex = attempt % available.length;
+        const newModel = available[retryIndex];
+        currentOptions = {
+          ...currentOptions,
+          modelStore: {
+            ...options.modelStore,
+            getSelectedModelId: () => newModel,
+          } as ModelStore,
+        };
+      }
+    }
+
+    const result = await askOpenRouterInternal(
+      currentMessages,
+      currentOptions,
+      useStream,
+      apiKey
+    );
+
+    // Check if result is an error that warrants a retry
+    const isError = result.startsWith('**Error:**') || result.startsWith('**API Error:**') || result.startsWith('**Network Error:**');
+    const isRateLimit = /rate limit|429|too many/i.test(result);
+    const isServerErr = /5[0-9][0-9]/.test(result);
+
+    if (!isError) {
+      // Success
+      return result;
+    }
+
+    lastError = result;
+
+    // Don't retry if user selected a specific model (not Auto)
+    if (options.modelStore?.getSelectedModelId() !== AUTO_MODEL_ID) {
+      break;
+    }
+
+    // Don't retry for certain errors that won't be fixed by changing models
+    if (!isRateLimit && !isServerErr && !result.includes('model')) {
+      break;
+    }
+
+    // Wait with exponential backoff before retrying
+    if (attempt < MAX_RETRY_ATTEMPTS - 1) {
+      const delay = BACKOFF_BASE_MS * Math.pow(2, attempt);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  // All attempts failed, return the last error
+  return lastError ?? '**Error:** Unknown error occurred';
+}
+
+async function askOpenRouterInternal(
+  messages: ChatMessage[],
+  options: AskOpenRouterOptions,
+  useStream: boolean,
+  apiKey: string
+): Promise<string> {
   const body = buildRequestBody(
     messages,
     options.modelStore,
@@ -203,8 +288,6 @@ export async function askOpenRouter(
   if (!('model' in body) && !('models' in body)) {
     return '**Error:** No models configured. Add a model in chat or set `openrouterAgent.models` in Settings.';
   }
-
-  const useStream = !!(options.stream && options.onChunk);
 
   try {
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -266,4 +349,13 @@ export async function askOpenRouter(
     const msg = err instanceof Error ? err.message : String(err);
     return `**Network Error:** ${msg}`;
   }
+}
+
+export async function askOpenRouter(
+  messages: ChatMessage[],
+  options: AskOpenRouterOptions
+): Promise<string> {
+  // For now, just call the internal function directly
+  // The fallback version is available as askOpenRouterWithFallback
+  return askOpenRouterWithFallback(messages, options);
 }

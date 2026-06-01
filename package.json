@@ -2,7 +2,7 @@
   "name": "openrouter-agent",
   "displayName": "OpenRouter Agent",
   "description": "Lightweight AI chat for VS Code and Cursor — Ask, Plan, and Agent modes powered by OpenRouter.",
-  "version": "1.7.0",
+  "version": "1.14.1",
   "publisher": "ZihadHosan",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -151,13 +151,27 @@
           "markdownDescription": "Stream assistant replies token-by-token in chat. Disable for slower machines or if you prefer instant full messages.",
           "order": 6
         },
+        "openrouterAgent.contextGatherTimeoutMs": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 500,
+          "maximum": 10000,
+          "markdownDescription": "Max milliseconds to wait for editor/workspace context before sending the request.",
+          "order": 7
+        },
+        "openrouterAgent.debugPerformance": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Log timing to the **Developer Console** (`[perf]` lines for context gather, API, etc.). Or set environment variable `DEBUG_PERF=1`.",
+          "order": 8
+        },
         "openrouterAgent.maxAttachments": {
           "type": "number",
           "default": 5,
           "minimum": 1,
           "maximum": 10,
           "markdownDescription": "Maximum files or images attached to a single message.",
-          "order": 7
+          "order": 9
         },
         "openrouterAgent.maxImageSizeMb": {
           "type": "number",
@@ -165,7 +179,7 @@
           "minimum": 1,
           "maximum": 20,
           "markdownDescription": "Maximum size per image attachment (MB).",
-          "order": 8
+          "order": 10
         },
         "openrouterAgent.maxPdfSizeMb": {
           "type": "number",
@@ -173,13 +187,14 @@
           "minimum": 1,
           "maximum": 50,
           "markdownDescription": "Maximum size per PDF attachment (MB).",
-          "order": 9
+          "order": 11
         }
       }
     }
   },
   "scripts": {
     "precompile": "node scripts/bump-version-on-change.mjs",
+    "build:hljs": "esbuild scripts/hljs-entry.mjs --bundle --minify --format=iife --global-name=hljs --footer:js=\"if(typeof hljs!=='undefined'&&hljs.hljs)hljs=hljs.hljs;\" --outfile=media/highlight.min.js",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
@@ -190,6 +205,7 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "highlight.js": "^11.11.1",
     "typescript": "^5.3.3"
   },
   "dependencies": {

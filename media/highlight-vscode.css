@@ -1,0 +1,94 @@
+/* VS Code–aligned highlight.js theme for chat code blocks */
+
+.code-editor-block .hljs {
+  background: transparent;
+  color: var(--vscode-editor-foreground, #d4d4d4);
+}
+
+body.vscode-dark .code-editor-block .hljs-comment,
+body.vscode-dark .code-editor-block .hljs-quote {
+  color: #6a9955;
+}
+body.vscode-dark .code-editor-block .hljs-keyword,
+body.vscode-dark .code-editor-block .hljs-selector-tag,
+body.vscode-dark .code-editor-block .hljs-built_in {
+  color: #569cd6;
+}
+body.vscode-dark .code-editor-block .hljs-string,
+body.vscode-dark .code-editor-block .hljs-regexp,
+body.vscode-dark .code-editor-block .hljs-addition {
+  color: #ce9178;
+}
+body.vscode-dark .code-editor-block .hljs-number,
+body.vscode-dark .code-editor-block .hljs-literal {
+  color: #b5cea8;
+}
+body.vscode-dark .code-editor-block .hljs-title,
+body.vscode-dark .code-editor-block .hljs-section,
+body.vscode-dark .code-editor-block .hljs-name {
+  color: #dcdcaa;
+}
+body.vscode-dark .code-editor-block .hljs-type,
+body.vscode-dark .code-editor-block .hljs-class .hljs-title {
+  color: #4ec9b0;
+}
+body.vscode-dark .code-editor-block .hljs-attr,
+body.vscode-dark .code-editor-block .hljs-attribute,
+body.vscode-dark .code-editor-block .hljs-variable,
+body.vscode-dark .code-editor-block .hljs-template-variable {
+  color: #9cdcfe;
+}
+body.vscode-dark .code-editor-block .hljs-symbol,
+body.vscode-dark .code-editor-block .hljs-bullet {
+  color: #d7ba7d;
+}
+body.vscode-dark .code-editor-block .hljs-meta {
+  color: #808080;
+}
+body.vscode-dark .code-editor-block .hljs-deletion {
+  color: #f44747;
+}
+
+body.vscode-light .code-editor-block .hljs-comment,
+body.vscode-light .code-editor-block .hljs-quote {
+  color: #008000;
+}
+body.vscode-light .code-editor-block .hljs-keyword,
+body.vscode-light .code-editor-block .hljs-selector-tag,
+body.vscode-light .code-editor-block .hljs-built_in {
+  color: #0000ff;
+}
+body.vscode-light .code-editor-block .hljs-string,
+body.vscode-light .code-editor-block .hljs-regexp,
+body.vscode-light .code-editor-block .hljs-addition {
+  color: #a31515;
+}
+body.vscode-light .code-editor-block .hljs-number,
+body.vscode-light .code-editor-block .hljs-literal {
+  color: #098658;
+}
+body.vscode-light .code-editor-block .hljs-title,
+body.vscode-light .code-editor-block .hljs-section,
+body.vscode-light .code-editor-block .hljs-name {
+  color: #795e26;
+}
+body.vscode-light .code-editor-block .hljs-type,
+body.vscode-light .code-editor-block .hljs-class .hljs-title {
+  color: #267f99;
+}
+body.vscode-light .code-editor-block .hljs-attr,
+body.vscode-light .code-editor-block .hljs-attribute,
+body.vscode-light .code-editor-block .hljs-variable,
+body.vscode-light .code-editor-block .hljs-template-variable {
+  color: #001080;
+}
+body.vscode-light .code-editor-block .hljs-symbol,
+body.vscode-light .code-editor-block .hljs-bullet {
+  color: #795e26;
+}
+body.vscode-light .code-editor-block .hljs-meta {
+  color: #808080;
+}
+body.vscode-light .code-editor-block .hljs-deletion {
+  color: #a31515;
+}

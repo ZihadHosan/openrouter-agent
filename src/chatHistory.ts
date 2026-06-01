@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { AgentMode } from './agent';
+import { AgentMode, ReasoningStep } from './agent';
 import { AttachmentMeta } from './attachments';
 import { AUTO_MODEL_ID } from './models';
 
@@ -14,6 +14,7 @@ export interface ChatSessionMessage {
   content: string;
   attachments?: AttachmentMeta[];
   details?: ToolDetailEntry[];
+  reasoning?: ReasoningStep[];
 }
 
 export interface SavedChatSession {
@@ -36,6 +37,7 @@ export interface SessionListItem {
 const SESSIONS_KEY = 'openrouterAgent.sessions';
 const ACTIVE_KEY = 'openrouterAgent.activeSessionId';
 const MAX_SESSIONS = 50;
+const MAX_HISTORY_WINDOW = 50; // Max messages to keep in memory per session
 
 export class ChatHistoryStore {
   private sessions: SavedChatSession[] = [];
@@ -116,7 +118,8 @@ export class ChatHistoryStore {
   }): Promise<void> {
     const session = this.getActive();
     if (data.messages !== undefined) {
-      session.messages = data.messages;
+      // Apply sliding window: keep only recent messages in memory
+      session.messages = this.applySlidingWindow(data.messages);
     }
     if (data.mode !== undefined) {
       session.mode = data.mode;
@@ -133,6 +136,21 @@ export class ChatHistoryStore {
     }
     session.updatedAt = Date.now();
     await this.persist();
+  }
+
+  /**
+   * Apply sliding window to keep only recent messages in memory.
+   * Full history is still persisted to storage.
+   */
+  private applySlidingWindow(messages: ChatSessionMessage[]): ChatSessionMessage[] {
+    if (messages.length <= MAX_HISTORY_WINDOW) {
+      return messages;
+    }
+    // Keep the last MAX_HISTORY_WINDOW messages (most recent)
+    // Also keep first 2 messages (usually system/initial context)
+    const firstContext = messages.slice(0, 2);
+    const recentMessages = messages.slice(messages.length - MAX_HISTORY_WINDOW);
+    return [...firstContext, ...recentMessages];
   }
 
   async switchSession(id: string): Promise<SavedChatSession | null> {
@@ -173,5 +191,41 @@ export class ChatHistoryStore {
     }
     await this.persist();
     return this.getActive();
+  }
+
+  /**
+   * Get full session without sliding window applied (for exports/backups).
+   */
+  getFullSession(id: string): SavedChatSession | null {
+    const session = this.sessions.find((s) => s.id === id);
+    if (!session) {
+      return null;
+    }
+    return { ...session, messages: [...session.messages] };
+  }
+
+  /**
+   * Export all sessions to a backup file.
+   */
+  async exportSessions(): Promise<string> {
+    return JSON.stringify(this.sessions, null, 2);
+  }
+
+  /**
+   * Import sessions from a backup string.
+   */
+  async importSessions(json: string): Promise<void> {
+    try {
+      const imported = JSON.parse(json) as SavedChatSession[];
+      if (Array.isArray(imported)) {
+        this.sessions = imported.slice(0, MAX_SESSIONS);
+        if (this.sessions.length > 0) {
+          this.activeId = this.sessions[0].id;
+          await this.persist();
+        }
+      }
+    } catch {
+      throw new Error('Invalid session backup format');
+    }
   }
 }

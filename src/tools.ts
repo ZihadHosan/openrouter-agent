@@ -14,6 +14,10 @@ import {
   type TerminalRunResult,
   type TerminalRunOptions,
 } from './terminalRunner';
+import {
+  getToolResultCache,
+  type ToolResultCache,
+} from './toolResultCache';
 
 export interface ToolHandlerContext {
   onPropose: (description: string) => void;
@@ -104,7 +108,16 @@ export type UserFileIntentKind =
   | 'read_all_markdown'
   | 'read_glob'
   | 'read_single_file'
+  | 'explore_project_stack'
   | null;
+
+/** Shown when the model emits native-tool interruption text without parseable agent-tool blocks. */
+export const TOOL_INTERRUPTION_RETRY_PROMPT =
+  'This extension does not use native one-tool-per-message APIs. Use ```agent-tool``` JSON blocks only. Put any explanation BEFORE tool blocks. For multiple files, emit several read_file blocks in one message. Do not output "Response interrupted" messages.';
+
+/** Shown when the model claims it cannot access workspace files without calling tools. */
+export const FILE_ACCESS_REFUSAL_RETRY_PROMPT =
+  'You have read_file, list_files, and read_glob. The workspace root is already in context. Call those tools now to read project files. Do not claim you cannot access files without attempting tools first.';
 
 export interface UserFileIntent {
   kind: UserFileIntentKind;
@@ -114,6 +127,14 @@ export interface UserFileIntent {
 
 export function detectUserFileIntent(userText: string): UserFileIntent {
   const text = userText.trim();
+
+  if (
+    /\b(tech\s*stack|technologies|what\s+(?:is|does)\s+this\s+project|this\s+project\s+use|project\s+use|built\s+with|dependencies)\b/i.test(
+      text
+    )
+  ) {
+    return { kind: 'explore_project_stack' };
+  }
 
   if (
     /\b(read|show|list|get|summarize|summarise)\b[\s\S]{0,40}\b(all|every|each)\b[\s\S]{0,40}\b(markdown|\.md)\b/i.test(
@@ -147,20 +168,33 @@ export function detectUserFileIntent(userText: string): UserFileIntent {
   return { kind: null };
 }
 
-export function buildAutoToolCall(intent: UserFileIntent): ToolCall | null {
+export function buildAutoToolCalls(intent: UserFileIntent): ToolCall[] {
   switch (intent.kind) {
+    case 'explore_project_stack':
+      return [
+        { tool: 'read_file', path: 'package.json' },
+        { tool: 'read_file', path: 'README.md' },
+      ];
     case 'read_all_markdown':
-      return { tool: 'read_glob', pattern: '**/*.md', maxFiles: 30 };
+      return [{ tool: 'read_glob', pattern: '**/*.md', maxFiles: 30 }];
     case 'read_glob':
-      return { tool: 'read_glob', pattern: intent.pattern ?? '**/*', maxFiles: 30 };
+      return [{ tool: 'read_glob', pattern: intent.pattern ?? '**/*', maxFiles: 30 }];
     case 'read_single_file':
       if (!intent.filename) {
-        return null;
+        return [];
       }
-      return { tool: 'read_file', path: intent.filename };
+      return [{ tool: 'read_file', path: intent.filename }];
     default:
-      return null;
+      return [];
   }
+}
+
+export function buildAutoToolCall(intent: UserFileIntent): ToolCall | null {
+  return buildAutoToolCalls(intent)[0] ?? null;
+}
+
+export function isProjectStackQuestion(userText: string): boolean {
+  return detectUserFileIntent(userText).kind === 'explore_project_stack';
 }
 
 export function requiresFileVerification(
@@ -180,9 +214,51 @@ export function requiresFileVerification(
   if (detectUserFileIntent(userText).kind !== null) {
     return true;
   }
-  return /\b(file|files|exist|readme|changelog|\.md\b|\.ts\b|\.json\b|workspace)\b/i.test(
+  return /\b(file|files|exist|readme|changelog|\.md\b|\.ts\b|\.json\b|workspace|project|tech\s*stack|technologies|stack|built\s+with|dependencies)\b/i.test(
     userText
   );
+}
+
+export function mentionsFileAccessRefusal(text: string): boolean {
+  return /\b(unable to access|cannot access|can't access|do not have access|don't have access|no access to (?:your |the )?files|can't read your|cannot read your|not able to (?:access|browse|read)(?:\s+your)?\s+files?|i (?:can't|cannot) (?:see|view|read) (?:your )?files?|without access to (?:your )?files?)\b/i.test(
+    text
+  );
+}
+
+export function hasToolInterruptionArtifact(text: string): boolean {
+  return /response interrupted by a tool use result/i.test(text);
+}
+
+export function stripToolInterruptionArtifacts(text: string): string {
+  return text
+    .replace(
+      /\[\s*Response interrupted by a tool use result[\s\S]*?\]/gi,
+      ''
+    )
+    .replace(/Response interrupted by a tool use result\.[^\n]*/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/** Skip showing model prose as the final answer when tools never ran but verification was required. */
+export function shouldSuppressVisibleAsFinal(
+  visible: string,
+  raw: string,
+  options: { needsVerification: boolean; toolsRun: number }
+): boolean {
+  if (!visible.trim()) {
+    return true;
+  }
+  if (options.toolsRun > 0 || !options.needsVerification) {
+    return false;
+  }
+  if (hasToolInterruptionArtifact(raw)) {
+    return true;
+  }
+  if (mentionsFileAccessRefusal(raw)) {
+    return true;
+  }
+  return false;
 }
 
 export function mentionsFileExistence(text: string): boolean {
@@ -248,7 +324,7 @@ export function normalizeModelToolSyntax(text: string): string {
 
 /** Remove harmony/channel delimiters (e.g. openrouter/owl-alpha `<|channel|>final<|message|>`). */
 export function sanitizeModelOutput(text: string): string {
-  const normalized = normalizeModelToolSyntax(text);
+  const normalized = stripToolInterruptionArtifacts(normalizeModelToolSyntax(text));
   if (!/<\|channel\|>/i.test(normalized)) {
     return normalized;
   }
@@ -283,24 +359,6 @@ function jsonObjectToStrArgs(obj: Record<string, unknown>): Record<string, strin
     }
   }
   return strArgs;
-}
-
-/** Owl-alpha / OpenRouter function-calls format: `<|function_call_begin|>read_file<|function_sep|>{"path":"..."}`. */
-function parseFunctionCallsFormat(text: string): ToolCall | null {
-  const normalized = normalizeModelToolSyntax(text);
-  const callRe =
-    /(?:<\|function_calls_begin\|>\s*)?<\|function_call_begin\|>\s*([\w-]+)\s*<\|function_sep\|>\s*(\{[\s\S]*?\})\s*(?:<\|function_call_end\|>(?:\s*<\|function_calls_end\|>)?)?/i;
-  const match = callRe.exec(normalized);
-  if (!match) {
-    const looseRe =
-      /<\|function_call_begin\|>\s*([\w-]+)\s*<\|function_sep\|>\s*(\{[\s\S]*?\})/i;
-    const loose = looseRe.exec(normalized);
-    if (!loose) {
-      return null;
-    }
-    return parseFunctionCallMatch(loose[1], loose[2]);
-  }
-  return parseFunctionCallMatch(match[1], match[2]);
 }
 
 function parseFunctionCallMatch(toolRaw: string, jsonStr: string): ToolCall | null {
@@ -395,29 +453,6 @@ function parseJsonToolObject(obj: Record<string, unknown>): ToolCall | null {
   return mapArgsToToolCall(normalizeToolName(tool), strArgs);
 }
 
-function parseAgentToolJson(text: string): ToolCall | null {
-  const blockMatch = text.match(/```agent-tool\s*\n([\s\S]*?)```/);
-  const jsonStr = blockMatch?.[1]?.trim();
-  if (jsonStr) {
-    try {
-      const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-      return parseJsonToolObject(obj);
-    } catch {
-      return null;
-    }
-  }
-  const inline = text.match(/\{[\s\S]*?"(?:tool|name)"\s*:\s*"[\w_-]+"[\s\S]*?\}/);
-  if (!inline) {
-    return null;
-  }
-  try {
-    const obj = JSON.parse(inline[0]) as Record<string, unknown>;
-    return parseJsonToolObject(obj);
-  } catch {
-    return null;
-  }
-}
-
 function parseXmlToolArgs(inner: string): Record<string, string> {
   const args: Record<string, string> = {};
   const pairRe =
@@ -437,16 +472,95 @@ function parseXmlToolArgs(inner: string): Record<string, string> {
   return args;
 }
 
-function parseXmlToolCall(text: string): ToolCall | null {
+function parseAllXmlToolCalls(text: string): ToolCall[] {
+  const results: ToolCall[] = [];
   const blockRe =
     /<[a-zA-Z0-9_-]*tool_call>\s*([\w-]+)\s*([\s\S]*?)<\/[a-zA-Z0-9_-]*tool_call>/gi;
-  const match = blockRe.exec(text);
-  if (!match) {
+  let match: RegExpExecArray | null;
+  while ((match = blockRe.exec(text)) !== null) {
+    const tool = normalizeToolName(match[1]);
+    const args = parseXmlToolArgs(match[2]);
+    results.push(mapArgsToToolCall(tool, args));
+  }
+  return results;
+}
+
+function parseAllAgentToolBlocks(text: string): ToolCall[] {
+  const results: ToolCall[] = [];
+  const re = /```agent-tool\s*\n([\s\S]*?)```/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    try {
+      const obj = JSON.parse(match[1].trim()) as Record<string, unknown>;
+      const call = parseJsonToolObject(obj);
+      if (call) {
+        results.push(call);
+      }
+    } catch {
+      /* skip malformed block */
+    }
+  }
+  if (results.length > 0) {
+    return results;
+  }
+  const inline = text.match(/\{[\s\S]*?"(?:tool|name)"\s*:\s*"[\w_-]+"[\s\S]*?\}/);
+  if (!inline) {
+    return results;
+  }
+  try {
+    const obj = JSON.parse(inline[0]) as Record<string, unknown>;
+    const call = parseJsonToolObject(obj);
+    if (call) {
+      results.push(call);
+    }
+  } catch {
+    /* skip malformed inline JSON */
+  }
+  return results;
+}
+
+function parseAllFunctionCallsFormat(text: string): ToolCall[] {
+  const normalized = normalizeModelToolSyntax(text);
+  const results: ToolCall[] = [];
+  const callRe =
+    /(?:<\|function_calls_begin\|>\s*)?<\|function_call_begin\|>\s*([\w-]+)\s*<\|function_sep\|>\s*(\{[\s\S]*?\})\s*(?:<\|function_call_end\|>(?:\s*<\|function_calls_end\|>)?)?/gi;
+  let match: RegExpExecArray | null;
+  while ((match = callRe.exec(normalized)) !== null) {
+    const call = parseFunctionCallMatch(match[1], match[2]);
+    if (call) {
+      results.push(call);
+    }
+  }
+  if (results.length === 0) {
+    const looseRe =
+      /<\|function_call_begin\|>\s*([\w-]+)\s*<\|function_sep\|>\s*(\{[\s\S]*?\})/gi;
+    while ((match = looseRe.exec(normalized)) !== null) {
+      const call = parseFunctionCallMatch(match[1], match[2]);
+      if (call) {
+        results.push(call);
+      }
+    }
+  }
+  return results;
+}
+
+const KNOWN_TOOLS = [
+  'list_files',
+  'read_file',
+  'read_glob',
+  'propose_write_file',
+  'run_command',
+] as const;
+
+function resolveKnownToolCall(raw: ToolCall | null): ToolCall | null {
+  if (!raw) {
     return null;
   }
-  const tool = normalizeToolName(match[1]);
-  const args = parseXmlToolArgs(match[2]);
-  return mapArgsToToolCall(tool, args);
+  const resolved = resolveToolCall(raw);
+  if (!KNOWN_TOOLS.includes(resolved.tool as (typeof KNOWN_TOOLS)[number])) {
+    return null;
+  }
+  return resolved;
 }
 
 /** Handles malformed XML (wrong closing tag, missing closes) from some OpenRouter models. */
@@ -476,23 +590,49 @@ function parseXmlToolCallLoose(text: string): ToolCall | null {
   return mapArgsToToolCall(tool, args);
 }
 
-export function parseToolCall(text: string): ToolCall | null {
+/** Parse every tool call in model output (same format priority as parseToolCall). */
+export function parseAllToolCalls(text: string): ToolCall[] {
   const normalized = normalizeModelToolSyntax(text);
-  const raw =
-    parseFunctionCallsFormat(normalized) ??
-    parseAgentToolJson(normalized) ??
-    parseOpenAiFunctionFormat(normalized) ??
-    parseXmlToolCall(normalized) ??
-    parseXmlToolCallLoose(normalized);
-  if (!raw) {
-    return null;
+
+  const fromFunctions = parseAllFunctionCallsFormat(normalized);
+  if (fromFunctions.length > 0) {
+    return fromFunctions
+      .map((c) => resolveKnownToolCall(c))
+      .filter((c): c is ToolCall => c !== null);
   }
-  const resolved = resolveToolCall(raw);
-  const known = ['list_files', 'read_file', 'read_glob', 'propose_write_file', 'run_command'];
-  if (!known.includes(resolved.tool)) {
-    return null;
+
+  const fromAgentBlocks = parseAllAgentToolBlocks(normalized);
+  if (fromAgentBlocks.length > 0) {
+    return fromAgentBlocks
+      .map((c) => resolveKnownToolCall(c))
+      .filter((c): c is ToolCall => c !== null);
   }
-  return resolved;
+
+  const openAi = parseOpenAiFunctionFormat(normalized);
+  if (openAi) {
+    const resolved = resolveKnownToolCall(openAi);
+    return resolved ? [resolved] : [];
+  }
+
+  const fromXml = parseAllXmlToolCalls(normalized);
+  if (fromXml.length > 0) {
+    return fromXml
+      .map((c) => resolveKnownToolCall(c))
+      .filter((c): c is ToolCall => c !== null);
+  }
+
+  const loose = parseXmlToolCallLoose(normalized);
+  const resolvedLoose = resolveKnownToolCall(loose);
+  return resolvedLoose ? [resolvedLoose] : [];
+}
+
+export function parseToolCall(text: string): ToolCall | null {
+  return parseAllToolCalls(text)[0] ?? null;
+}
+
+/** True when two or more read-only tools can run concurrently. */
+export function canParallelizeReadTools(calls: ToolCall[]): boolean {
+  return calls.length >= 2 && calls.every((c) => isReadOnlyTool(c.tool));
 }
 
 export function stripToolBlock(text: string): string {
@@ -520,11 +660,23 @@ export function stripToolBlock(text: string): string {
 }
 
 export function cleanAssistantVisibleText(text: string): string {
-  const stripped = stripToolBlock(text);
+  const stripped = stripToolInterruptionArtifacts(stripToolBlock(text));
   if (!stripped || hasToolCallMarkup(stripped)) {
     return '';
   }
   return stripped;
+}
+
+/** True when the model output is only tool markup (no user-visible prose yet). */
+export function isToolCallOnly(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (cleanAssistantVisibleText(trimmed)) {
+    return false;
+  }
+  return hasToolCallMarkup(trimmed) || parseToolCall(trimmed) !== null;
 }
 
 export function describeToolCall(call: ToolCall): string {
@@ -640,6 +792,13 @@ export async function executeListFiles(
     return JSON.stringify({ error: 'No workspace folder open.' });
   }
 
+  // Check cache first
+  const cacheKey = pattern.trim().toLowerCase();
+  const cached = toolResultCache.get('list_files', { pattern: cacheKey, maxResults: String(maxResults) });
+  if (cached) {
+    return cached;
+  }
+
   const normalized = normalizeGlobPattern(pattern);
   const capped = Math.min(Math.max(maxResults, 1), 500);
   const uris = await vscode.workspace.findFiles(
@@ -650,7 +809,9 @@ export async function executeListFiles(
 
   const root = getWorkspaceRoot()!.fsPath;
   const files = uris.map((u) => path.relative(root, u.fsPath).replace(/\\/g, '/'));
-  return JSON.stringify({ pattern: normalized, files, count: files.length }, null, 2);
+  const result = JSON.stringify({ pattern: normalized, files, count: files.length }, null, 2);
+  toolResultCache.set('list_files', { pattern: cacheKey, maxResults: String(maxResults) }, result);
+  return result;
 }
 
 const READ_GLOB_MAX_FILES = 40;
@@ -665,6 +826,13 @@ export async function executeReadGlob(
     return JSON.stringify({ error: 'No workspace folder open.' });
   }
 
+  // Check cache first
+  const cacheKey = pattern.trim().toLowerCase();
+  const cached = toolResultCache.get('read_glob', { pattern: cacheKey, maxFiles: String(maxFiles) });
+  if (cached) {
+    return cached;
+  }
+
   const normalized = normalizeGlobPattern(pattern);
   const cappedFiles = Math.min(Math.max(maxFiles, 1), READ_GLOB_MAX_FILES);
   const listJson = JSON.parse(await executeListFiles(normalized, cappedFiles)) as {
@@ -675,7 +843,9 @@ export async function executeReadGlob(
   };
 
   if (listJson.error) {
-    return JSON.stringify(listJson);
+    const result = JSON.stringify(listJson);
+    // Don't cache errors
+    return result;
   }
 
   const matched = listJson.files ?? [];
@@ -698,7 +868,7 @@ export async function executeReadGlob(
     results.push({ path: readJson.path ?? rel, content });
   }
 
-  return JSON.stringify(
+  const result = JSON.stringify(
     {
       pattern: normalized,
       count: results.length,
@@ -709,14 +879,35 @@ export async function executeReadGlob(
     null,
     2
   );
+  toolResultCache.set('read_glob', { pattern: cacheKey, maxFiles: String(maxFiles) }, result);
+  return result;
+}
+
+// Tool result cache instance
+const toolResultCache: ToolResultCache = getToolResultCache();
+
+export function clearToolResultCache(): void {
+  toolResultCache.clearAll();
+}
+
+export function invalidateReadFileCache(filePath: string): void {
+  toolResultCache.clearForPath(filePath);
 }
 
 export async function executeReadFile(filePath: string): Promise<string> {
+  const cacheKey = filePath.trim().toLowerCase();
+  const cached = toolResultCache.get('read_file', { path: cacheKey });
+  if (cached) {
+    return cached;
+  }
+
   const uri = await resolveReadableFileUri(filePath);
   if (!uri) {
-    return JSON.stringify({
+    const result = JSON.stringify({
       error: 'Invalid path, path outside workspace, or file not found. Use a path relative to the workspace root.',
     });
+    // Don't cache errors
+    return result;
   }
 
   try {
@@ -729,9 +920,12 @@ export async function executeReadFile(filePath: string): Promise<string> {
         : content;
     const root = getWorkspaceRoot()!.fsPath;
     const relative = path.relative(root, uri.fsPath).replace(/\\/g, '/');
-    return JSON.stringify({ path: relative, content: truncated }, null, 2);
+    const result = JSON.stringify({ path: relative, content: truncated }, null, 2);
+    toolResultCache.set('read_file', { path: cacheKey }, result);
+    return result;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    // Don't cache errors
     return JSON.stringify({ error: msg });
   }
 }
@@ -869,6 +1063,7 @@ export async function applyWriteFile(filePath: string, content: string): Promise
   try {
     await vscode.workspace.fs.createDirectory(dir);
     await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(content));
+    invalidateReadFileCache(filePath);
     return JSON.stringify({ success: true, path: uri.fsPath });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -951,6 +1146,105 @@ export async function executeRunCommand(
   const result = await runCommandInWorkspace(command, workDir, callbacks, options);
   ctx?.onTerminalOutput?.(result);
   return formatTerminalResultForAgent(result);
+}
+
+/**
+ * Execute multiple read tools in parallel
+ * Returns results as an array of { tool, result, error } objects
+ * 
+ * Note: ctx and signal are reserved for future use but not currently used
+ * because each tool handles its own execution internally
+ */
+export async function executeReadToolsInParallel(
+  calls: ToolCall[],
+  _ctx?: ToolHandlerContext,
+  _signal?: AbortSignal
+): Promise<{ tool: ToolCall; result: string; displayNote?: string }[]> {
+  // Group tools by type for parallel execution
+  const readFiles: ToolCall[] = [];
+  const listFiles: ToolCall[] = [];
+  const readGlobs: ToolCall[] = [];
+
+  for (const call of calls) {
+    switch (call.tool) {
+      case 'read_file':
+        readFiles.push(call);
+        break;
+      case 'list_files':
+        listFiles.push(call);
+        break;
+      case 'read_glob':
+        readGlobs.push(call);
+        break;
+      default:
+        // Non-read tools are handled separately
+        break;
+    }
+  }
+
+  const results: { tool: ToolCall; result: string; displayNote?: string }[] = [];
+
+  // Execute read_file calls in parallel (with a limit)
+  if (readFiles.length > 0) {
+    const readResults = await Promise.allSettled(
+      readFiles.map((call) => executeReadFile(call.path || ''))
+    );
+    readFiles.forEach((call, idx) => {
+      const result = readResults[idx];
+      if (result.status === 'fulfilled') {
+        results.push({ tool: call, result: result.value });
+      } else {
+        results.push({
+          tool: call,
+          result: JSON.stringify({ error: result.reason?.message || String(result.reason) }),
+        });
+      }
+    });
+  }
+
+  // Execute list_files calls in parallel
+  if (listFiles.length > 0) {
+    const listResults = await Promise.allSettled(
+      listFiles.map((call) => executeListFiles(call.pattern, call.maxResults))
+    );
+    listFiles.forEach((call, idx) => {
+      const result = listResults[idx];
+      if (result.status === 'fulfilled') {
+        results.push({ tool: call, result: result.value });
+      } else {
+        results.push({
+          tool: call,
+          result: JSON.stringify({ error: result.reason?.message || String(result.reason) }),
+        });
+      }
+    });
+  }
+
+  // Execute read_glob calls in parallel
+  if (readGlobs.length > 0) {
+    const globResults = await Promise.allSettled(
+      readGlobs.map((call) =>
+        executeReadGlob(call.pattern ?? '**/*', call.maxFiles ?? 25)
+      )
+    );
+    readGlobs.forEach((call, idx) => {
+      const result = globResults[idx];
+      if (result.status === 'fulfilled') {
+        results.push({
+          tool: call,
+          result: result.value,
+          displayNote: `Read files matching ${call.pattern ?? '**/*'}`,
+        });
+      } else {
+        results.push({
+          tool: call,
+          result: JSON.stringify({ error: result.reason?.message || String(result.reason) }),
+        });
+      }
+    });
+  }
+
+  return results;
 }
 
 export async function handleToolCall(

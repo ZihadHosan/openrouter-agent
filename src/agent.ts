@@ -4,10 +4,16 @@ import {
   ResolvedAttachment,
 } from './attachments';
 import { ChatMessage } from './openrouter';
+import { getContextCache } from './contextCache';
 
 export type AgentMode = 'ask' | 'plan' | 'agent';
 
 export type { ResolvedAttachment };
+
+export interface ReasoningStep {
+  type: 'reasoning' | 'self-critique' | 'chain-of-thought';
+  content: string;
+}
 
 const MAX_FILE_CHARS = 12000;
 
@@ -16,9 +22,39 @@ export interface PromptContext {
   activeFilePath: string;
   selectedText: string;
   fileContent: string;
+  /** True when context gathering hit the time limit. */
+  incomplete?: boolean;
 }
 
-export async function gatherContext(): Promise<PromptContext> {
+const CONTEXT_GATHER_TIMEOUT_MS = 1500;
+
+/**
+ * Generate a cache key based on context-relevant state
+ */
+function generateContextKey(): string {
+  const editor = vscode.window.activeTextEditor;
+  const document = editor?.document;
+  const keyParts: string[] = [];
+
+  // Include workspace count (changes when folders added/removed)
+  keyParts.push(`ws:${vscode.workspace.workspaceFolders?.length ?? 0}`);
+
+  // Include active editor info
+  if (document) {
+    keyParts.push(`doc:${document.uri.fsPath}`);
+    keyParts.push(`ver:${document.version}`);
+  }
+
+  // Include selection info
+  const selection = editor?.selection;
+  if (selection && !selection.isEmpty) {
+    keyParts.push(`sel:${selection.start.line}:${selection.start.character}:${selection.end.line}:${selection.end.character}`);
+  }
+
+  return keyParts.join('|');
+}
+
+function gatherContextSync(): PromptContext {
   const folders = vscode.workspace.workspaceFolders;
   const workspaceName = folders?.[0]?.name ?? '(no workspace)';
 
@@ -32,11 +68,81 @@ export async function gatherContext(): Promise<PromptContext> {
 
   let fileContent = '';
   if (editor && !selectedText) {
-    const full = editor.document.getText();
-    fileContent = truncateContent(full, MAX_FILE_CHARS);
+    // Parallelize: read file content in background while collecting other info
+    fileContent = editor.document.getText();
+    fileContent = truncateContent(fileContent, MAX_FILE_CHARS);
   }
 
   return { workspaceName, activeFilePath, selectedText, fileContent };
+}
+
+/**
+ * Prefetch common context data in parallel
+ * Returns a promise that resolves when prefetching is complete
+ */
+export async function prefetchContext(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return;
+  }
+
+  // Prefetch file content for the active editor (triggers internal caching)
+  void editor.document.getText();
+
+  // Prefetch workspace folder info (triggers internal caching)
+  void vscode.workspace.workspaceFolders;
+
+  // Small delay to allow the editor to finish rendering
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
+export async function gatherContext(): Promise<PromptContext> {
+  const timeoutMs = vscode.workspace
+    .getConfiguration('openrouterAgent')
+    .get<number>('contextGatherTimeoutMs', CONTEXT_GATHER_TIMEOUT_MS);
+
+  // Try to get cached context first
+  const cache = getContextCache();
+  const cacheKey = generateContextKey();
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    // Convert CachedContext to PromptContext (exclude timestamp)
+    const { timestamp, fileVersion, ...promptContext } = cached;
+    return promptContext;
+  }
+
+  try {
+    const context = await Promise.race([
+      Promise.resolve(gatherContextSync()),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('__CONTEXT_TIMEOUT__')), Math.max(timeoutMs, 500));
+      }),
+    ]);
+
+    // Cache the result
+    cache.set(cacheKey, { ...context, timestamp: Date.now() });
+    return context;
+  } catch (err) {
+    // Try to use cached context even if gathering failed (stale but better than nothing)
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      // Convert CachedContext to PromptContext (exclude timestamp)
+      const { timestamp, fileVersion, ...promptContext } = cached;
+      return promptContext;
+    }
+
+    if (err instanceof Error && err.message === '__CONTEXT_TIMEOUT__') {
+      const folders = vscode.workspace.workspaceFolders;
+      return {
+        workspaceName: folders?.[0]?.name ?? '(no workspace)',
+        activeFilePath: '',
+        selectedText: '',
+        fileContent: '',
+        incomplete: true,
+      };
+    }
+    throw err;
+  }
 }
 
 function truncateContent(text: string, max: number): string {
@@ -78,9 +184,17 @@ Preferred tool format:
 \`\`\`
 
 Tools (read-only, run immediately in Ask mode):
-- read_file — one file: {"tool":"read_file","path":"path/to/file.md"}
+- read_file — one file: {"tool":"read_file","path":"path/to/file.md"} (several read_file blocks in one message are OK)
 - list_files — find paths: {"tool":"list_files","pattern":"**/*.md","maxResults":200}
 - read_glob — read many files at once: {"tool":"read_glob","pattern":"**/*.md","maxFiles":30}
+
+Put any explanation BEFORE tool blocks, not inside them. Tool JSON must not appear in streamed chat text.
+
+TOOL FORMAT:
+- Use text \`\`\`agent-tool\`\`\` JSON blocks only (not Claude/Roo native tool_use).
+- Multiple read-only tools per message are supported (they run in parallel).
+- Never output "Response interrupted by a tool use result" or similar meta messages.
+- You CAN read the workspace via tools; workspace root is in context. Never say you cannot access project files without calling read_file, list_files, or read_glob first.
 
 IMPORTANT glob rules:
 - Use "**/*.md" to match markdown in ALL subfolders. NEVER use "*.md" alone (root only).
@@ -121,16 +235,26 @@ Tools:
 4. propose_write_file — {"tool":"propose_write_file","path":"path","content":"full file text"}
 5. run_command — {"tool":"run_command","command":"npm test","cwd":"optional/subfolder","background":false}
 
+REASONING STEPS (optional, but recommended for complex tasks):
+- Before tool calls, you may add reasoning steps to think through the problem:
+  1. chain-of-thought: Break down the problem into steps
+  2. self-critique: Review your plan and identify potential issues
+- Format: Start with "THOUGHT:" followed by your reasoning
+- After reasoning, proceed with tool calls as normal
+
 Rules:
 - Use "**/*.md" not "*.md" when searching subfolders.
 - NEVER claim a file exists or is missing without tool JSON proof.
 - Commands run in the chat terminal. Short commands wait for completion and show Success or Failed.
 - Long-running commands (npm run dev, npm start, watch, serve) auto-run in background unless "background":false.
 - Use "background":true explicitly for dev servers; initial output is captured then the process keeps running.
-- Output ONLY one \`\`\`agent-tool JSON block when calling a tool (no XML like <tool_call>).
-- Put any explanation BEFORE the code block, not inside it.
-- After list_files/read_file you will receive JSON results; then continue or answer the user.
-- One tool per message. Wait for results before the next tool.${MARKDOWN_FORMAT}`;
+- Use \`\`\`agent-tool JSON blocks (no XML like <tool_call>).
+- Put any explanation BEFORE the tool blocks, not inside them.
+- For reading multiple files, you may emit several read_file blocks in one message (they run in parallel).
+- Do NOT combine read_file with write or run_command in the same message — one write/command per turn.
+- Use text \`\`\`agent-tool\`\`\` blocks only (not native tool_use). Never output "Response interrupted" meta messages.
+- You CAN read the workspace via tools; workspace root is in context. Never claim you cannot access files without calling read_file, list_files, or read_glob first.
+- After list_files/read_file you will receive JSON results; then continue or answer the user.${MARKDOWN_FORMAT}`;
 
 export function buildPrompt(
   mode: AgentMode,
@@ -156,6 +280,9 @@ function buildContextBlock(ctx: PromptContext): string {
   const parts: string[] = [];
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   parts.push(`- Workspace: ${ctx.workspaceName}`);
+  if (ctx.incomplete) {
+    parts.push('- Note: Editor context was limited (timeout); use tools to read files if needed.');
+  }
   if (root) {
     parts.push(`- Workspace root: ${root}`);
   }
@@ -196,4 +323,136 @@ export function sessionMessageToApiMessage(
   }
   const content = buildUserMessageContent(m.content, resolvedAttachments, null);
   return { role: 'user', content };
+}
+
+/**
+ * Extract reasoning steps from assistant message content
+ */
+export function extractReasoningSteps(content: string): ReasoningStep[] {
+  const steps: ReasoningStep[] = [];
+  
+  // Pattern to match "THOUGHT:" sections
+  const thoughtPattern = /THOUGHT:\s*([\s\S]*?)(?=(\nTHOUGHT:|\n\`\`\`agent-tool|^$))/gi;
+  let match;
+  
+  while ((match = thoughtPattern.exec(content)) !== null) {
+    const thoughtContent = match[1].trim();
+    
+    // Determine the type of reasoning
+    let type: ReasoningStep['type'] = 'reasoning';
+    const lower = thoughtContent.toLowerCase();
+    
+    if (lower.includes('self-critique') || lower.includes('review') || lower.includes('critique')) {
+      type = 'self-critique';
+    } else if (lower.includes('chain') || lower.includes('step') || lower.includes('breakdown')) {
+      type = 'chain-of-thought';
+    }
+    
+    steps.push({ type, content: thoughtContent });
+  }
+  
+  return steps;
+}
+
+/**
+ * Pre-filter tools based on user intent and mode
+ * Returns a list of tool names that are relevant to the user's request
+ */
+export function preFilterToolsBasedOnIntent(
+  userText: string,
+  mode: AgentMode
+): string[] {
+  const text = userText.toLowerCase();
+  const allowedTools = new Set<string>();
+
+  // Read-only tools (allowed in all modes)
+  if (mode !== 'plan') {
+    allowedTools.add('read_file');
+    allowedTools.add('list_files');
+    allowedTools.add('read_glob');
+  }
+
+  // Mode-specific tools
+  if (mode === 'agent') {
+    allowedTools.add('propose_write_file');
+    allowedTools.add('run_command');
+  }
+
+  // Based on user intent patterns in the text
+  if (/\b(read|show|list|find|get|summarize)\b/i.test(text)) {
+    // User wants to read/list files
+    allowedTools.delete('propose_write_file');
+    allowedTools.delete('run_command');
+  }
+
+  if (/\b(create|write|edit|update|modify|add|change)\b/i.test(text)) {
+    // User wants to create/modify files - only Agent mode
+    if (mode === 'agent') {
+      allowedTools.add('propose_write_file');
+    } else {
+      allowedTools.delete('read_file');
+      allowedTools.delete('list_files');
+      allowedTools.delete('read_glob');
+    }
+  }
+
+  if (/\b(run|execute|build|test|start|server|command)\b/i.test(text)) {
+    // User wants to run commands - only Agent mode
+    if (mode === 'agent') {
+      allowedTools.add('run_command');
+    } else {
+      allowedTools.clear();
+    }
+  }
+
+  if (/\b(debug|fix|error|bug)\b/i.test(text)) {
+    // User wants to debug/fix - prefer read tools
+    allowedTools.clear();
+    allowedTools.add('read_file');
+    if (mode === 'agent') {
+      allowedTools.add('propose_write_file');
+      allowedTools.add('run_command');
+    }
+  }
+
+  // If no specific intent found, use defaults based on mode
+  if (allowedTools.size === 0) {
+    if (mode === 'ask') {
+      allowedTools.add('read_file');
+      allowedTools.add('list_files');
+      allowedTools.add('read_glob');
+    } else if (mode === 'agent') {
+      allowedTools.add('read_file');
+      allowedTools.add('list_files');
+      allowedTools.add('read_glob');
+      allowedTools.add('propose_write_file');
+      allowedTools.add('run_command');
+    }
+  }
+
+  return Array.from(allowedTools);
+}
+
+/**
+ * Build a hint string about available tools based on pre-filtering
+ */
+export function buildToolHint(allowedTools: string[]): string {
+  if (allowedTools.length === 0) {
+    return '';
+  }
+
+  const toolNames: Record<string, string> = {
+    read_file: 'read_file (single file)',
+    list_files: 'list_files (find paths)',
+    read_glob: 'read_glob (many files)',
+    propose_write_file: 'propose_write_file',
+    run_command: 'run_command',
+  };
+
+  const names = allowedTools
+    .map((t) => toolNames[t])
+    .filter(Boolean)
+    .join(', ');
+
+  return `Available tools (based on your request): ${names}`;
 }

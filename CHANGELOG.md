@@ -7,6 +7,41 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Tool interruption text in chat** — strip Roo-style `[Response interrupted by a tool use result…]` from streams and replies; retry with correct `agent-tool` format when models emit it without runnable tools.
+- **False "can't access files" in Agent/Ask** — tech-stack and project questions trigger auto-read of `package.json` and `README.md`, broader file-verification rules, and retries when models refuse to call tools without reading the workspace.
+
+### Changed
+- System prompts clarify text `agent-tool` format, parallel read tools, and that workspace files are readable via tools.
+
+---
+
+## [1.13.1] — 2026-06-01
+
+### Added
+- **Editor-style code blocks** — fenced code renders as mini editor panels with line numbers, language label, syntax highlighting (highlight.js), and one-click copy.
+- **Copy icon feedback** — icon-only copy button swaps to a green checkmark for ~1.5s after a successful copy.
+- **Tool result cache** — `read_file`, `list_files`, and `read_glob` results are cached with TTL to avoid redundant workspace reads within a session.
+- **Context cache** — workspace and active-file context is cached briefly to speed repeated prompts in the same session.
+- **Parallel read tools** — multiple read tools emitted in one assistant turn run concurrently (capped batch size).
+- **Model fallback on API errors** — Auto mode retries with alternate models and exponential backoff when the API returns retryable errors.
+- **Workspace indexer** — background file scan on activation builds an in-memory index (foundation for fast search).
+- **Performance debug** — setting `openrouterAgent.debugPerformance` (or env `DEBUG_PERF=1`) logs `[perf]` timing spans to the Developer Console.
+- **Sliding-window chat history** — keeps the last 50 messages in memory per session to reduce payload size on long chats.
+- **`npm run build:hljs`** — bundles highlight.js languages into `media/highlight.min.js`.
+
+### Fixed
+- **Tool JSON in chat stream** — raw `agent-tool` / tool-call markup is stripped during streaming in Ask and Agent modes, so models like `openrouter/owl-alpha` no longer dump tool JSON into visible replies.
+- **Batch file reads** — system prompts allow multiple `read_file` calls in one response when the model needs several files at once.
+
+### Changed
+- **Code block styling** — single elevated surface for header, gutter, and code; softer outer border; no header divider or mismatched grey backgrounds.
+- Agent system prompt documents optional `THOUGHT:` reasoning prefix before tool calls.
+
+---
+
 ## [1.4.1] — 2026-05-30
 
 ### Added
@@ -14,12 +49,6 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 - Attachments sent to OpenRouter as multimodal message content; **Auto** prefers vision-capable models when images/PDFs are attached.
 - Attachment previews in chat history; files stored locally under extension global storage (not in settings JSON).
 - Settings: `openrouterAgent.maxAttachments`, `maxImageSizeMb`, `maxPdfSizeMb`.
-
----
-
-## [Unreleased]
-
-_Nothing yet._
 
 ---
 

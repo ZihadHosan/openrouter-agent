@@ -89,7 +89,7 @@ Install locally:
 
 ```bash
 npm run compile
-npx @vscode/vsce publish --packagePath openrouter-agent-1.3.0.vsix
+npx @vscode/vsce publish --packagePath openrouter-agent-1.14.0.vsix
 ```
 
 Replace `1.3.0` with the version in `package.json`.
