@@ -11,17 +11,24 @@ import {
   attachmentAnalysisLabel,
   hasTextAttachments,
   hasVisionAttachments,
-  modelSupportsVision,
 } from './attachments';
 import { formatAutoModelLabel, pickAutoModelForRequest } from './autoModel';
 import { ApiKeyStore } from './apiKeyStore';
 import { ApprovalBridge, PermissionChoice } from './approvalBridge';
 import { ChatHistoryStore } from './chatHistory';
 import type { ChatSessionMessage, ToolDetailEntry } from './chatHistory';
-import { ADD_MODEL_OPTION, AUTO_MODEL_ID, ModelStore, REMOVE_MODEL_OPTION } from './models';
+import { AUTO_MODEL_ID, ModelStore } from './models';
 
 export type { ChatSessionMessage, ToolDetailEntry };
 import { askOpenRouter, AskOpenRouterAbortedError, ChatMessage } from './openrouter';
+import {
+  getAccountBalanceForWebview,
+  getOpenRouterBalanceCache,
+} from './openrouterBalance';
+import {
+  getModelPricingCache,
+  isModelPricingEnabled,
+} from './openrouterModels';
 import {
   describeProcessDone,
   describeProcessStep,
@@ -53,6 +60,7 @@ import {
 
 import { stopAllRunningProcesses } from './terminalRunner';
 import { PerfSpan } from './perf';
+import { getModelPickerWebviewScript } from './modelPickerWebviewScript';
 
 const STREAM_POST_THROTTLE_MS = 100;
 
@@ -74,10 +82,11 @@ export class ChatViewProvider {
   private streamActiveForUi = false;
   private hasVisionInRequest = false;
   private stripToolLeaksInStream = false;
+  private balanceRefreshTimer?: ReturnType<typeof setInterval>;
   private readonly approvalBridge: ApprovalBridge;
 
   constructor(
-    private readonly extensionUri: vscode.Uri,
+    private readonly context: vscode.ExtensionContext,
     private readonly modelStore: ModelStore,
     private readonly historyStore: ChatHistoryStore,
     private readonly apiKeyStore: ApiKeyStore,
@@ -86,11 +95,11 @@ export class ChatViewProvider {
     this.approvalBridge = new ApprovalBridge((msg) => this.post(msg));
   }
 
-  private loadActiveSession(): void {
+  private async loadActiveSession(): Promise<void> {
     const session = this.historyStore.getActive();
     this.history = [...session.messages];
     this.mode = session.mode;
-    void this.modelStore.setSelectedModelId(session.modelId);
+    await this.modelStore.setSelectedModelId(session.modelId);
   }
 
   private async persistSession(titleFromMessage?: string): Promise<void> {
@@ -102,16 +111,16 @@ export class ChatViewProvider {
     });
   }
 
-  private applySessionToUi(session: {
+  private async applySessionToUi(session: {
     messages: ChatSessionMessage[];
     mode: AgentMode;
     modelId: string;
-  }): void {
+  }): Promise<void> {
     this.attachmentStore.clearPending();
     this.history = [...session.messages];
     this.mode = session.mode;
-    void this.modelStore.setSelectedModelId(session.modelId);
-    void this.syncState();
+    await this.modelStore.setSelectedModelId(session.modelId);
+    await this.syncState();
   }
 
   private getWebview(): vscode.Webview | undefined {
@@ -148,7 +157,7 @@ export class ChatViewProvider {
   private attachWebview(webview: vscode.Webview): void {
     webview.options = {
       enableScripts: true,
-      localResourceRoots: [this.extensionUri],
+      localResourceRoots: [this.context.extensionUri],
     };
     webview.html = this.getHtml(webview);
     webview.onDidReceiveMessage((msg) => {
@@ -195,20 +204,23 @@ export class ChatViewProvider {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [this.extensionUri],
+        localResourceRoots: [this.context.extensionUri],
       }
     );
 
     this.panel.iconPath = {
-      light: vscode.Uri.joinPath(this.extensionUri, 'media', 'icon-light.svg'),
-      dark: vscode.Uri.joinPath(this.extensionUri, 'media', 'icon-dark.svg'),
+      light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'icon-light.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'icon-dark.svg'),
     };
 
     this.attachWebview(this.panel.webview);
 
     this.panel.onDidDispose(() => {
+      this.stopBalanceRefresh();
       this.panel = undefined;
     });
+
+    this.startBalanceRefresh();
   }
 
   async focus(): Promise<void> {
@@ -220,6 +232,12 @@ export class ChatViewProvider {
 
   private async handleWebviewMessage(msg: {
     type: string;
+    enabled?: boolean;
+    catalog?: { id: string; tier: string; supportsVision: boolean }[];
+    autoPoolEnabled?: string[];
+    selectedModelId?: string;
+    visible?: boolean;
+    message?: string;
     text?: string;
     mode?: string;
     modelId?: string;
@@ -290,7 +308,7 @@ export class ChatViewProvider {
         }
         clearToolResultCache();
         await this.persistSession();
-        this.applySessionToUi(await this.historyStore.newSession());
+        await this.applySessionToUi(await this.historyStore.newSession());
         break;
       case 'switchSession': {
         if (this.processing) {
@@ -301,7 +319,7 @@ export class ChatViewProvider {
         await this.persistSession();
         const session = await this.historyStore.switchSession(id);
         if (session) {
-          this.applySessionToUi(session);
+          await this.applySessionToUi(session);
         }
         break;
       }
@@ -327,7 +345,7 @@ export class ChatViewProvider {
           break;
         }
         const session = await this.historyStore.deleteSession(id);
-        this.applySessionToUi(session);
+        await this.applySessionToUi(session);
         break;
       }
       case 'setMode':
@@ -339,80 +357,26 @@ export class ChatViewProvider {
       case 'setModel':
         await this.modelStore.setSelectedModelId(String(msg.modelId ?? AUTO_MODEL_ID));
         await this.persistSession();
+        await this.postModelState();
+        await this.syncModelPricing();
+        await this.syncAccountBalance(true);
+        await this.syncModelCapability();
         break;
-      case 'addModel': {
-        const result = await this.modelStore.addCustomModel(String(msg.model ?? ''));
-        if (result.ok) {
-          const id = String(msg.model ?? '').trim();
-          await this.modelStore.setSelectedModelId(id);
-          this.post({ type: 'modelAdded', modelId: id, ...this.modelStore.getStateForWebview() });
-        } else {
-          this.post({ type: 'error', message: result.error ?? 'Could not add model.' });
-        }
-        break;
-      }
-      case 'promptAddModel': {
-        const model = await vscode.window.showInputBox({
-          title: 'Add OpenRouter Model',
-          prompt: 'Model id from openrouter.ai/models',
-          placeHolder: 'anthropic/claude-3.5-sonnet',
-          ignoreFocusOut: true,
-        });
-        if (!model?.trim()) {
-          this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
-          break;
-        }
-        const result = await this.modelStore.addCustomModel(model);
-        if (result.ok) {
-          const id = model.trim();
-          await this.modelStore.setSelectedModelId(id);
-          this.post({ type: 'modelAdded', modelId: id, ...this.modelStore.getStateForWebview() });
-        } else {
-          void vscode.window.showWarningMessage(
-            `OpenRouter Agent: ${result.error ?? 'Could not add model.'}`
-          );
-          this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
-        }
-        break;
-      }
-      case 'promptRemoveModel': {
-        const custom = this.modelStore.getCustomModels();
-        if (custom.length === 0) {
-          void vscode.window.showInformationMessage(
-            'OpenRouter Agent: No chat-added models to remove. Edit Settings (openrouterAgent.models) to change default models.'
-          );
-          this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
-          break;
-        }
-        const picked = await vscode.window.showQuickPick(
-          custom.map((m) => ({ label: m, description: 'Added via Add model… in chat' })),
-          {
-            title: 'Remove OpenRouter Model',
-            placeHolder: 'Select a chat-added model to remove from the dropdown',
-            ignoreFocusOut: true,
-          }
+      case 'setAutoPoolModel': {
+        const enabled = msg.enabled === true;
+        const result = await this.modelStore.toggleAutoPoolModel(
+          String(msg.modelId ?? ''),
+          enabled
         );
-        if (!picked) {
-          this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
-          break;
-        }
-        const result = await this.modelStore.removeCustomModel(picked.label);
         if (!result.ok) {
-          void vscode.window.showWarningMessage(
-            `OpenRouter Agent: ${result.error ?? 'Could not remove model.'}`
-          );
-          this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
-          break;
+          this.post({ type: 'error', message: result.error ?? 'Could not update Auto pool.' });
         }
-        if (this.modelStore.getSelectedModelId() === picked.label) {
-          await this.modelStore.setSelectedModelId(AUTO_MODEL_ID);
-        }
-        await this.persistSession();
-        this.post({ type: 'modelRemoved', ...this.modelStore.getStateForWebview() });
+        await this.postModelState();
+        await this.syncModelCapability();
         break;
       }
       case 'ready':
-        this.loadActiveSession();
+        await this.loadActiveSession();
         await this.syncState();
         if (this.pendingUserMessage) {
           const text = this.pendingUserMessage;
@@ -522,6 +486,114 @@ export class ChatViewProvider {
       activeSessionId: sessionId,
       chatFontSize: this.getChatFontSize(),
       ...this.modelStore.getStateForWebview(),
+    });
+    await this.postModelCatalog();
+    await this.syncModelPricing();
+    await this.syncAccountBalance();
+    await this.syncModelCapability();
+  }
+
+  /** Public so commands can refresh after API key changes. */
+  async syncAccountBalance(force = false): Promise<void> {
+    const display = await getAccountBalanceForWebview(this.apiKeyStore, force);
+    this.post({ type: 'accountBalance', ...display });
+  }
+
+  private refreshBalanceAfterPrompt(): void {
+    getOpenRouterBalanceCache().invalidate();
+    void this.syncAccountBalance(true);
+  }
+
+  private startBalanceRefresh(): void {
+    this.stopBalanceRefresh();
+    void this.syncAccountBalance();
+    this.balanceRefreshTimer = setInterval(() => {
+      void this.syncAccountBalance();
+    }, 60_000);
+  }
+
+  private stopBalanceRefresh(): void {
+    if (this.balanceRefreshTimer !== undefined) {
+      clearInterval(this.balanceRefreshTimer);
+      this.balanceRefreshTimer = undefined;
+    }
+  }
+
+  private getPricingCache() {
+    return getModelPricingCache(this.context);
+  }
+
+  private supportsVision(modelId: string): boolean {
+    return this.getPricingCache().supportsVision(modelId);
+  }
+
+  private buildCapabilityHint(): { visible: boolean; message: string } {
+    const selected = this.modelStore.getSelectedModelId();
+    if (selected === AUTO_MODEL_ID) {
+      const pool = this.modelStore.getAutoPoolModels();
+      if (!this.getPricingCache().poolHasVisionModel(pool)) {
+        return {
+          visible: true,
+          message:
+            'None of your Auto models can read images or PDFs. Turn on a vision model in the model menu, or select one directly.',
+        };
+      }
+      return { visible: false, message: '' };
+    }
+    if (!this.supportsVision(selected)) {
+      return {
+        visible: true,
+        message:
+          'This model is text only — it cannot read images or PDFs. Choose a vision-capable model for photos and PDFs.',
+      };
+    }
+    return { visible: false, message: '' };
+  }
+
+  private async syncModelCapability(): Promise<void> {
+    const hint = this.buildCapabilityHint();
+    this.post({ type: 'modelCapability', ...hint });
+  }
+
+  private async postModelState(): Promise<void> {
+    this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
+  }
+
+  private async postModelCatalog(): Promise<void> {
+    const cache = this.getPricingCache();
+    try {
+      await cache.ensureLoaded(this.apiKeyStore);
+    } catch {
+      // use stale cache if any
+    }
+    await this.modelStore.pruneAutoPoolToCatalog(cache.getCatalogIds());
+    this.post({
+      type: 'modelCatalog',
+      catalog: cache.getCatalogForPicker(),
+      ...this.modelStore.getStateForWebview(),
+    });
+    await this.syncModelCapability();
+  }
+
+  private async syncModelPricing(): Promise<void> {
+    if (!isModelPricingEnabled()) {
+      this.post({ type: 'modelPricing', hidden: true });
+      return;
+    }
+    const cache = getModelPricingCache(this.context);
+    try {
+      await cache.ensureLoaded(this.apiKeyStore);
+    } catch {
+      // use stale cache if any
+    }
+    const modelId = this.modelStore.getSelectedModelId();
+    const display = cache.getDisplayForModel(modelId);
+    this.post({
+      type: 'modelPricing',
+      line: display.line,
+      segments: display.segments,
+      compact: display.compact,
+      title: display.title,
     });
   }
 
@@ -728,7 +800,7 @@ export class ChatViewProvider {
     if (
       modelId !== AUTO_MODEL_ID &&
       hasVisionAttachments(pending) &&
-      !modelSupportsVision(modelId)
+      !this.supportsVision(modelId)
     ) {
       const useAutoItem: vscode.MessageItem = { title: 'Use Auto' };
       const sendAnywayItem: vscode.MessageItem = { title: 'Send anyway' };
@@ -750,18 +822,34 @@ export class ChatViewProvider {
       }
     }
 
-    if (modelId === AUTO_MODEL_ID && hasVisionAttachments(pending)) {
-      const visionPick = pickAutoModelForRequest(this.modelStore.getAvailableModels(), {
-        mode,
-        userMessage: trimmed,
-        conversationLength: this.history.length,
-        hasVisionAttachments: true,
+    const pool = this.modelStore.getAutoPoolModels();
+    const visionFn = (id: string) => this.supportsVision(id);
+
+    if (modelId === AUTO_MODEL_ID && !this.modelStore.isAutoPoolValid()) {
+      this.post({
+        type: 'error',
+        message:
+          'Turn on at least 3 models for Auto (use the switches in the model menu), then Enable Auto.',
       });
+      return;
+    }
+
+    if (modelId === AUTO_MODEL_ID && hasVisionAttachments(pending)) {
+      const visionPick = pickAutoModelForRequest(
+        pool,
+        {
+          mode,
+          userMessage: trimmed,
+          conversationLength: this.history.length,
+          hasVisionAttachments: true,
+        },
+        visionFn
+      );
       if (!visionPick) {
         this.post({
           type: 'error',
           message:
-            'No vision-capable model in your list. Add one via **Add model…** (e.g. google/gemini-2.0-flash-001) or pick a vision model.',
+            'No vision-capable model is enabled for Auto. Turn on a vision model in the model menu (e.g. google/gemini-2.0-flash-001), or pick one directly.',
         });
         return;
       }
@@ -769,7 +857,7 @@ export class ChatViewProvider {
 
     await this.modelStore.setSelectedModelId(modelId);
     if (modelId === AUTO_MODEL_ID) {
-      this.post({ type: 'models', ...this.modelStore.getStateForWebview() });
+      await this.postModelState();
     }
 
     const sessionId = this.historyStore.getActiveId();
@@ -807,12 +895,16 @@ export class ChatViewProvider {
     const modelLabel =
       modelId === AUTO_MODEL_ID
         ? formatAutoModelLabel(
-            pickAutoModelForRequest(this.modelStore.getAvailableModels(), {
-              mode,
-              userMessage: trimmed,
-              conversationLength: this.history.length,
-              hasVisionAttachments: this.hasVisionInRequest,
-            }) || '…'
+            pickAutoModelForRequest(
+              pool,
+              {
+                mode,
+                userMessage: trimmed,
+                conversationLength: this.history.length,
+                hasVisionAttachments: this.hasVisionInRequest,
+              },
+              visionFn
+            ) || '…'
           )
         : modelId.length > 28
           ? modelId.slice(0, 28) + '…'
@@ -899,6 +991,7 @@ export class ChatViewProvider {
           sessions: this.historyStore.listSessions(),
           activeSessionId: this.historyStore.getActiveId(),
         });
+        this.refreshBalanceAfterPrompt();
         return;
       }
 
@@ -916,6 +1009,7 @@ export class ChatViewProvider {
         sessions: this.historyStore.listSessions(),
         activeSessionId: this.historyStore.getActiveId(),
       });
+      this.refreshBalanceAfterPrompt();
     } catch (err) {
       this.cancelStreamUi();
       if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
@@ -938,6 +1032,7 @@ export class ChatViewProvider {
       this.activeAbortController = undefined;
       this.streamActiveForUi = false;
       this.setLoading(false);
+      this.refreshBalanceAfterPrompt();
     }
   }
 
@@ -1549,16 +1644,14 @@ export class ChatViewProvider {
 
   private getHtml(webview: vscode.Webview): string {
     const nonce = getNonce();
-    const addModelOption = ADD_MODEL_OPTION;
-    const removeModelOption = REMOVE_MODEL_OPTION;
     const markedUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, 'media', 'marked.min.js')
+      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'marked.min.js')
     );
     const hljsUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, 'media', 'highlight.min.js')
+      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'highlight.min.js')
     );
     const highlightCssUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, 'media', 'highlight-vscode.css')
+      vscode.Uri.joinPath(this.context.extensionUri, 'media', 'highlight-vscode.css')
     );
     const chatFontSize = this.getChatFontSize();
     const fontSizeCss =
@@ -1653,7 +1746,9 @@ export class ChatViewProvider {
       width: auto;
     }
     .dropdown-trigger.model-trigger {
-      max-width: 200px;
+      min-width: 88px;
+      max-width: 160px;
+      width: auto;
     }
     .dropdown-trigger:hover:not(:disabled) {
       border-color: var(--vscode-focusBorder);
@@ -1708,6 +1803,12 @@ export class ChatViewProvider {
       box-shadow: 0 4px 12px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
       padding: 4px 0;
     }
+    .dropdown-menu[hidden],
+    .dropdown-menu.is-closed {
+      display: none !important;
+      pointer-events: none;
+      visibility: hidden;
+    }
     .dropdown-item {
       display: block;
       width: 100%;
@@ -1744,6 +1845,204 @@ export class ChatViewProvider {
       display: inline-flex;
       align-items: center;
       min-width: 0;
+    }
+    .model-capability-hint {
+      flex: 0 1 auto;
+      width: fit-content;
+      max-width: calc(100% - 6.5rem);
+      font-size: 0.7em;
+      line-height: 1.35;
+      font-weight: 400;
+      color: var(--vscode-editorWarning-foreground, #d19a2e);
+      background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #d19a2e) 10%, transparent);
+      border-radius: 6px;
+      padding: 6px 10px;
+      margin: 0;
+    }
+    .model-capability-hint.hidden {
+      display: none;
+    }
+    .model-picker-menu {
+      width: 380px;
+      min-width: 380px;
+      max-width: min(380px, calc(100vw - 16px));
+      max-height: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+    .model-picker-auto-header {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      background: var(--vscode-editor-inactiveSelectionBackground, rgba(128,128,128,0.08));
+    }
+    .model-picker-auto-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .model-picker-auto-title {
+      font-weight: 600;
+      font-size: 0.9em;
+    }
+    .model-picker-auto-action {
+      font-family: inherit;
+      font-size: 0.78em;
+      font-weight: 500;
+      padding: 4px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--vscode-input-border);
+      background: var(--vscode-input-background);
+      color: var(--vscode-foreground);
+      cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .model-picker-auto-action.enable.ready {
+      background: #2dd4bf;
+      border-color: #2dd4bf;
+      color: #0f172a;
+    }
+    .model-picker-auto-action.enable:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .model-picker-auto-action.disable:hover {
+      border-color: var(--vscode-focusBorder);
+    }
+    .model-picker-auto-hint,
+    .model-picker-auto-status {
+      font-size: 0.72em;
+      line-height: 1.4;
+      color: var(--vscode-descriptionForeground);
+    }
+    .model-picker-pick-section {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      flex: 1 1 auto;
+    }
+    .model-picker-toolbar {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 6px;
+      padding: 8px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+    }
+    .model-picker-search {
+      flex: 1;
+      min-width: 0;
+      box-sizing: border-box;
+      font-family: inherit;
+      font-size: 0.85em;
+      padding: 5px 8px;
+      border: 1px solid var(--vscode-input-border);
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border-radius: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+    }
+    .model-picker-tags {
+      display: flex;
+      flex-shrink: 0;
+      gap: 4px;
+      align-items: center;
+    }
+    .model-picker-tag {
+      font-family: inherit;
+      font-size: 0.72em;
+      font-weight: 500;
+      padding: 2px 8px;
+      border: 1px solid var(--vscode-input-border);
+      background: var(--vscode-input-background);
+      color: var(--vscode-foreground);
+      border-radius: 10px;
+      cursor: pointer;
+      line-height: 1.4;
+      white-space: nowrap;
+    }
+    .model-picker-tag:hover {
+      border-color: var(--vscode-focusBorder);
+    }
+    .model-picker-tag.active {
+      background: #2dd4bf;
+      border-color: #2dd4bf;
+      color: #0f172a;
+    }
+    .model-picker-list {
+      overflow-y: auto;
+      flex: 1 1 auto;
+      min-height: 48px;
+      max-height: 300px;
+    }
+    .model-picker-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      padding: 2px 6px 2px 4px;
+    }
+    .model-picker-row-id-btn {
+      flex: 1;
+      min-width: 0;
+      text-align: left;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.78em;
+      padding: 5px 8px;
+      border: none;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--vscode-foreground);
+      cursor: pointer;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .model-picker-row-id-btn:hover {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .model-picker-row-id-btn.selected {
+      background: var(--vscode-list-activeSelectionBackground);
+      color: var(--vscode-list-activeSelectionForeground);
+    }
+    .model-pool-switch {
+      flex-shrink: 0;
+      width: 32px;
+      height: 18px;
+      border-radius: 9px;
+      border: none;
+      padding: 0;
+      background: var(--vscode-input-border);
+      cursor: pointer;
+      position: relative;
+    }
+    .model-pool-switch.on {
+      background: #2dd4bf;
+    }
+    .model-pool-switch::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--vscode-editor-background, #fff);
+      transition: left 0.15s ease;
+    }
+    .model-pool-switch.on::after {
+      left: 16px;
+    }
+    .model-picker-empty {
+      padding: 12px 10px;
+      font-size: 0.8em;
+      color: var(--vscode-descriptionForeground);
     }
     .dropdown-separator {
       height: 1px;
@@ -1987,6 +2286,15 @@ export class ChatViewProvider {
       .stream-cursor {
         animation: none;
         opacity: 0.75;
+      }
+      .composer.composer-busy {
+        border-color: var(--vscode-focusBorder);
+        outline: 1px solid var(--vscode-focusBorder);
+        background: var(--vscode-input-background);
+      }
+      .composer.composer-busy::before {
+        content: none;
+        animation: none;
       }
     }
     .msg.thinking {
@@ -2278,6 +2586,8 @@ export class ChatViewProvider {
       overflow: visible;
     }
     .composer {
+      container-type: inline-size;
+      container-name: composer;
       display: flex;
       flex-direction: column;
       border: 1px solid var(--vscode-input-border);
@@ -2285,9 +2595,107 @@ export class ChatViewProvider {
       background: var(--vscode-input-background);
       overflow: visible;
     }
+    .composer-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 0;
+    }
+    .composer-top:has(.model-capability-hint:not(.hidden)),
+    .composer-top:has(.account-balance:not(.hidden)) {
+      padding: 6px 8px 0;
+    }
+    .composer-top:has(.model-capability-hint.hidden) .account-balance:not(.hidden) {
+      margin-left: auto;
+    }
+    .account-balance {
+      flex: 0 0 auto;
+      align-self: center;
+      font-size: 0.72em;
+      line-height: 1.2;
+      pointer-events: auto;
+      white-space: nowrap;
+    }
+    .account-balance .balance-short {
+      display: none;
+    }
+    @container composer (max-width: 360px) {
+      .account-balance .balance-full {
+        display: none;
+      }
+      .account-balance .balance-short {
+        display: inline;
+      }
+    }
+    .account-balance.hidden {
+      display: none;
+    }
+    .account-balance.positive {
+      font-weight: 700;
+      color: var(--vscode-charts-teal, #4ec9b0);
+    }
+    .account-balance.zero {
+      font-weight: 700;
+      color: var(--vscode-editorWarning-foreground, #cca700);
+    }
     .composer:focus-within {
       border-color: var(--vscode-focusBorder);
       outline: 1px solid var(--vscode-focusBorder);
+    }
+    @property --composer-snake-angle {
+      syntax: '<angle>';
+      initial-value: 0deg;
+      inherits: false;
+    }
+    @keyframes composerSnakeTravel {
+      to {
+        --composer-snake-angle: 360deg;
+      }
+    }
+    .composer.composer-busy {
+      position: relative;
+      border-color: transparent;
+      outline: none;
+      background: var(--vscode-input-background);
+    }
+    .composer.composer-busy::before {
+      content: '';
+      position: absolute;
+      inset: -1px;
+      border-radius: 11px;
+      z-index: 0;
+      pointer-events: none;
+      transform: none;
+      --composer-snake-angle: 0deg;
+      background: conic-gradient(
+        from var(--composer-snake-angle),
+        transparent 0deg,
+        transparent 180deg,
+        var(--vscode-focusBorder) 186deg,
+        color-mix(in srgb, var(--vscode-charts-teal, #4ec9b0) 50%, white) 270deg,
+        var(--vscode-charts-teal, #4ec9b0) 306deg,
+        var(--vscode-focusBorder) 324deg,
+        transparent 360deg
+      );
+      animation: composerSnakeTravel 5s linear infinite;
+      padding: 1px;
+      -webkit-mask:
+        linear-gradient(#fff 0 0) content-box,
+        linear-gradient(#fff 0 0);
+      -webkit-mask-composite: xor;
+      mask:
+        linear-gradient(#fff 0 0) content-box,
+        linear-gradient(#fff 0 0);
+      mask-composite: exclude;
+    }
+    .composer.composer-busy > * {
+      position: relative;
+      z-index: 1;
+    }
+    .composer.composer-busy:focus-within {
+      outline: none;
+      border-color: transparent;
     }
     #input {
       width: 100%;
@@ -2307,6 +2715,8 @@ export class ChatViewProvider {
       color: var(--vscode-input-placeholderForeground);
     }
     .composer-footer {
+      container-type: inline-size;
+      container-name: composerFooter;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -2320,6 +2730,52 @@ export class ChatViewProvider {
       gap: 8px;
       flex-wrap: wrap;
       min-width: 0;
+    }
+    .model-pricing {
+      flex: 1;
+      min-width: 0;
+      text-align: center;
+      font-size: 0.72em;
+      line-height: 1.3;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      opacity: 0.9;
+    }
+    .model-pricing.hidden {
+      display: none;
+    }
+    .model-pricing-compact {
+      display: inline;
+      color: var(--vscode-charts-teal, #4ec9b0);
+      font-weight: 500;
+      text-transform: lowercase;
+    }
+    .model-pricing-compact:empty {
+      display: none;
+    }
+    .model-pricing-full {
+      display: none;
+    }
+    .model-pricing-full .model-pricing-muted {
+      color: var(--vscode-descriptionForeground);
+      opacity: 0.85;
+    }
+    .model-pricing-full .model-pricing-sep {
+      color: var(--vscode-descriptionForeground);
+      opacity: 0.65;
+    }
+    .model-pricing-full .model-pricing-value {
+      color: var(--vscode-charts-teal, #4ec9b0);
+      font-weight: 500;
+    }
+    @container composerFooter (min-width: 300px) {
+      .model-pricing-compact {
+        display: none;
+      }
+      .model-pricing-full {
+        display: inline;
+      }
     }
     .composer-right {
       display: flex;
@@ -2611,6 +3067,10 @@ export class ChatViewProvider {
   </div>
   <div class="composer-wrap">
     <div class="composer" id="composer">
+      <div class="composer-top">
+        <div id="modelCapabilityHint" class="model-capability-hint hidden" role="status"></div>
+        <div id="accountBalance" class="account-balance hidden" role="status" aria-live="polite"></div>
+      </div>
       <div id="attachmentBar" class="attachment-bar"></div>
       <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — attach, paste, or drop images — Enter to send"></textarea>
       <div class="composer-footer">
@@ -2619,6 +3079,10 @@ export class ChatViewProvider {
           <div class="model-picker">
             <div id="modelDropdown"></div>
           </div>
+        </div>
+        <div id="modelPricing" class="model-pricing hidden" aria-live="polite">
+          <span class="model-pricing-compact"></span>
+          <span class="model-pricing-full"></span>
         </div>
         <div class="composer-right">
           <button type="button" id="attachBtn" class="attach-btn" title="Add files or images" aria-label="Add files">
@@ -2635,13 +3099,14 @@ export class ChatViewProvider {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const AUTO_MODEL = '${AUTO_MODEL_ID}';
-    const ADD_MODEL = '${addModelOption}';
-    const REMOVE_MODEL = '${removeModelOption}';
     const messagesEl = document.getElementById('messages');
+    const modelCapabilityHintEl = document.getElementById('modelCapabilityHint');
     const jumpToBottomBtn = document.getElementById('jumpToBottomBtn');
     const inputEl = document.getElementById('input');
     const composerEl = document.getElementById('composer');
     const attachmentBar = document.getElementById('attachmentBar');
+    const modelPricingEl = document.getElementById('modelPricing');
+    const accountBalanceEl = document.getElementById('accountBalance');
     const attachBtn = document.getElementById('attachBtn');
     const sendBtn = document.getElementById('sendBtn');
     const sendSpinner = document.getElementById('sendSpinner');
@@ -2655,6 +3120,7 @@ export class ChatViewProvider {
     let streamingBody = null;
     let streamText = '';
     let streamRenderTimer = null;
+    let streamRenderGeneration = 0;
     const STREAM_RENDER_MS = 80;
     const SCROLL_BOTTOM_THRESHOLD = 48;
     let stickToBottom = true;
@@ -2962,27 +3428,8 @@ export class ChatViewProvider {
       }
     });
 
-    const modelDropdown = createCustomDropdown(document.getElementById('modelDropdown'), {
-      triggerClass: 'pill-trigger model-trigger',
-      title: 'Model',
-      value: AUTO_MODEL,
-      wideMenu: true,
-      onBeforeSelect: function(opt) {
-        if (opt.value === ADD_MODEL) {
-          vscode.postMessage({ type: 'promptAddModel' });
-          return false;
-        }
-        if (opt.value === REMOVE_MODEL) {
-          vscode.postMessage({ type: 'promptRemoveModel' });
-          return false;
-        }
-        return true;
-      },
-      onChange: function(modelId) {
-        lastModelId = modelId;
-        vscode.postMessage({ type: 'setModel', modelId: modelId });
-      }
-    });
+    ${getModelPickerWebviewScript()}
+    const modelDropdown = createModelPickerDropdown(document.getElementById('modelDropdown'));
 
     function escapeHtml(text) {
       const d = document.createElement('div');
@@ -2991,6 +3438,9 @@ export class ChatViewProvider {
     }
 
     function renderCodeEditorBlock(code, lang) {
+      if (!String(code).trim()) {
+        return '';
+      }
       var language = (lang || 'plaintext').trim().toLowerCase();
       var langLabel = language || 'plaintext';
       if (language === 'text') {
@@ -3042,6 +3492,9 @@ export class ChatViewProvider {
           var lang = token.lang;
           if (typeof text !== 'string') {
             text = String(text);
+          }
+          if (!text.trim()) {
+            return '';
           }
           return renderCodeEditorBlock(text, lang);
         }
@@ -3458,7 +3911,12 @@ export class ChatViewProvider {
       return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     }
 
+    function bumpStreamRenderGeneration() {
+      streamRenderGeneration += 1;
+    }
+
     function removeStreamUi(removeNode) {
+      bumpStreamRenderGeneration();
       if (streamRenderTimer) {
         clearTimeout(streamRenderTimer);
         streamRenderTimer = null;
@@ -3520,7 +3978,11 @@ export class ChatViewProvider {
       streamRenderTimer = null;
       var body = streamingBody;
       var text = streamText;
+      var gen = streamRenderGeneration;
       var doRender = function() {
+        if (gen !== streamRenderGeneration || !streamingBody || body !== streamingBody) {
+          return;
+        }
         body.innerHTML = formatContent(text, 'assistant');
         var cursor = document.createElement('span');
         cursor.className = 'stream-cursor';
@@ -3556,23 +4018,31 @@ export class ChatViewProvider {
     }
 
     function cancelAssistantStream() {
+      bumpStreamRenderGeneration();
       removeStreamUi(true);
     }
 
     function finishAssistantStream(content, details) {
       removeThinking(true);
+      bumpStreamRenderGeneration();
       if (streamRenderTimer) {
         clearTimeout(streamRenderTimer);
         streamRenderTimer = null;
       }
       if (streamingEl && streamingBody) {
-        streamingEl.classList.remove('streaming');
-        streamingEl.classList.add('msg-enter');
-        streamingBody.innerHTML = formatContent(content, 'assistant');
-        bindMessageLinks(streamingBody);
-        wrapTables(streamingBody);
-        appendToolDetails(streamingEl, details);
-        scrollMessageIntoView(streamingEl, 'start', stickToBottom);
+        var el = streamingEl;
+        var body = streamingBody;
+        el.classList.remove('streaming');
+        el.classList.add('msg-enter');
+        body.innerHTML = formatContent(content, 'assistant');
+        var stray = body.querySelector('.stream-cursor');
+        if (stray) {
+          stray.remove();
+        }
+        bindMessageLinks(body);
+        wrapTables(body);
+        appendToolDetails(el, details);
+        scrollMessageIntoView(el, 'start', stickToBottom);
         streamingEl = null;
         streamingBody = null;
         streamText = '';
@@ -3737,28 +4207,82 @@ export class ChatViewProvider {
       }
     }
 
-    function populateModels(state) {
-      const models = state.availableModels || [];
-      const selected = state.selectedModelId || AUTO_MODEL;
-      var opts = [{
-        value: AUTO_MODEL,
-        label: 'Auto',
-        shortLabel: 'Auto',
-        title: 'Picks the best model from your available list based on mode and message (Settings → openrouterAgent.models, Add model…).'
-      }];
-      models.forEach(function(m) {
-        opts.push({ value: m, label: m, shortLabel: shortModelLabel(m), title: m });
-      });
-      opts.push({ separator: true });
-      opts.push({ value: ADD_MODEL, label: 'Add model…' });
-      opts.push({ value: REMOVE_MODEL, label: 'Remove model…', title: 'Remove a model added via Add model… (Settings models: edit openrouterAgent.models)' });
-      var val = selected;
-      if (selected !== AUTO_MODEL && models.indexOf(selected) === -1) {
-        val = models.length ? models[0] : AUTO_MODEL;
+    function updateModelPricing(msg) {
+      if (!modelPricingEl) return;
+      var compactEl = modelPricingEl.querySelector('.model-pricing-compact');
+      var fullEl = modelPricingEl.querySelector('.model-pricing-full');
+      if (msg.hidden) {
+        modelPricingEl.classList.add('hidden');
+        if (compactEl) compactEl.textContent = '';
+        if (fullEl) fullEl.textContent = '';
+        return;
       }
-      modelDropdown.setOptions(opts);
-      modelDropdown.setValue(val);
-      lastModelId = val;
+      modelPricingEl.classList.remove('hidden');
+      modelPricingEl.title = msg.title || msg.line || 'Pricing from OpenRouter catalog';
+      if (compactEl) {
+        compactEl.textContent = msg.compact || '';
+      }
+      if (!fullEl) return;
+      fullEl.textContent = '';
+      var segs = msg.segments || [];
+      if (!segs.length && msg.line) {
+        fullEl.textContent = msg.line;
+        return;
+      }
+      segs.forEach(function(seg) {
+        var span = document.createElement('span');
+        span.textContent = seg.text || '';
+        if (seg.teal) {
+          span.className = 'model-pricing-value';
+        } else if (seg.text === ' | ') {
+          span.className = 'model-pricing-sep';
+        } else {
+          span.className = 'model-pricing-muted';
+        }
+        fullEl.appendChild(span);
+      });
+    }
+
+    function applyModelState(state) {
+      if (state.catalog) {
+        modelDropdown.setCatalog(state.catalog);
+      }
+      modelDropdown.applyState(state);
+    }
+
+    function updateModelCapability(msg) {
+      if (!modelCapabilityHintEl) return;
+      if (msg.visible && msg.message) {
+        modelCapabilityHintEl.textContent = msg.message;
+        modelCapabilityHintEl.classList.remove('hidden');
+      } else {
+        modelCapabilityHintEl.textContent = '';
+        modelCapabilityHintEl.classList.add('hidden');
+      }
+    }
+
+    function updateAccountBalance(msg) {
+      if (!accountBalanceEl) return;
+      if (!msg.visible || !msg.label) {
+        accountBalanceEl.innerHTML = '';
+        accountBalanceEl.title = '';
+        accountBalanceEl.classList.add('hidden');
+        accountBalanceEl.classList.remove('positive', 'zero');
+        return;
+      }
+      accountBalanceEl.innerHTML = '';
+      var fullEl = document.createElement('span');
+      fullEl.className = 'balance-full';
+      fullEl.textContent = msg.label;
+      var shortEl = document.createElement('span');
+      shortEl.className = 'balance-short';
+      shortEl.textContent = msg.shortLabel || msg.label;
+      accountBalanceEl.appendChild(fullEl);
+      accountBalanceEl.appendChild(shortEl);
+      accountBalanceEl.title = msg.title || msg.label;
+      accountBalanceEl.classList.remove('hidden');
+      accountBalanceEl.classList.toggle('positive', !msg.isZero);
+      accountBalanceEl.classList.toggle('zero', !!msg.isZero);
     }
 
     function renderPendingAttachments() {
@@ -3917,6 +4441,9 @@ export class ChatViewProvider {
 
     function setLoading(loading, label, process) {
       processing = loading;
+      if (composerEl) {
+        composerEl.classList.toggle('composer-busy', loading);
+      }
       inputEl.disabled = loading || approvalPending;
       if (attachBtn) attachBtn.disabled = loading || approvalPending;
       modeDropdown.setDisabled(loading || approvalPending);
@@ -4003,7 +4530,7 @@ export class ChatViewProvider {
           removeThinking(true);
           applyChatFontSize(msg.chatFontSize || 0);
           modeDropdown.setValue(msg.mode || 'ask');
-          populateModels(msg);
+          applyModelState(msg);
           populateSessions(msg.sessions, msg.activeSessionId);
           pendingAttachments = msg.pendingAttachments || [];
           renderPendingAttachments();
@@ -4021,19 +4548,19 @@ export class ChatViewProvider {
           populateSessions(msg.sessions, msg.activeSessionId);
           break;
         case 'models':
-          populateModels(msg);
+          applyModelState(msg);
           break;
-        case 'modelAdded':
-          populateModels(msg);
-          if (msg.modelId) {
-            modelDropdown.setValue(msg.modelId);
-            lastModelId = msg.modelId;
-          }
+        case 'modelCatalog':
+          applyModelState(msg);
           break;
-        case 'modelRemoved':
-          populateModels(msg);
-          modelDropdown.setValue(msg.selectedModelId || AUTO_MODEL);
-          lastModelId = msg.selectedModelId || AUTO_MODEL;
+        case 'modelCapability':
+          updateModelCapability(msg);
+          break;
+        case 'modelPricing':
+          updateModelPricing(msg);
+          break;
+        case 'accountBalance':
+          updateAccountBalance(msg);
           break;
         case 'userMessage':
           stickToBottom = true;

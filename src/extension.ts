@@ -7,6 +7,8 @@ import { ChatViewProvider } from './chatView';
 import { ModelStore } from './models';
 import { askOpenRouter } from './openrouter';
 import { promptPermissionMode } from './permissions';
+import { getOpenRouterBalanceCache } from './openrouterBalance';
+import { getModelPricingCache } from './openrouterModels';
 import { getWorkspaceIndexer } from './workspaceIndexer';
 let chatProvider: ChatViewProvider;
 let modelStore: ModelStore;
@@ -25,11 +27,12 @@ function backgroundPrefetch(): void {
 
 export function activate(context: vscode.ExtensionContext): void {
   modelStore = new ModelStore(context);
+  void modelStore.ensureAutoPoolMigrated();
   apiKeyStore = new ApiKeyStore(context);
   attachmentStore = new AttachmentStore(context);
   const historyStore = new ChatHistoryStore(context);
   chatProvider = new ChatViewProvider(
-    context.extensionUri,
+    context,
     modelStore,
     historyStore,
     apiKeyStore,
@@ -37,6 +40,8 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void apiKeyStore.migrateFromSettingsIfNeeded();
+
+  void getModelPricingCache(context).ensureLoaded(apiKeyStore);
 
   chatProvider.refreshWebviewIfOpen();
 
@@ -69,8 +74,12 @@ export function activate(context: vscode.ExtensionContext): void {
       void promptPermissionMode();
     }),
 
-    vscode.commands.registerCommand('openrouterAgent.setApiKey', () => {
-      void apiKeyStore.promptSetApiKey();
+    vscode.commands.registerCommand('openrouterAgent.setApiKey', async () => {
+      const ok = await apiKeyStore.promptSetApiKey();
+      if (ok) {
+        getOpenRouterBalanceCache().invalidate();
+        void chatProvider.syncAccountBalance(true);
+      }
     }),
     vscode.commands.registerCommand('openrouterAgent.clearApiKey', async () => {
       if (!(await apiKeyStore.hasKey())) {
@@ -85,6 +94,8 @@ export function activate(context: vscode.ExtensionContext): void {
       );
       if (choice === 'Remove') {
         await apiKeyStore.clear();
+        getOpenRouterBalanceCache().invalidate();
+        void chatProvider.syncAccountBalance();
         void vscode.window.showInformationMessage('OpenRouter Agent: API key removed.');
       }
     }),
@@ -188,6 +199,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('openrouterAgent.chatFontSize')) {
         chatProvider.refreshWebview();
+      }
+      if (e.affectsConfiguration('openrouterAgent.showAccountBalance')) {
+        void chatProvider.syncAccountBalance(true);
       }
     })
   );

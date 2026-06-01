@@ -124,26 +124,26 @@ Open **Settings** (`Ctrl+,`) and search **`openrouterAgent`**.
 
 | Setting | Purpose |
 |---------|---------|
-| **`openrouterAgent.models`** | Up to 3 models in the **Auto** pool (defaults are free-tier; add any OpenRouter id in chat) |
 | **`openrouterAgent.agentPermissions`** | `ask` · `readOnly` · `workspace` · `full` |
 | **`openrouterAgent.shell`** | Custom shell for in-chat commands |
 | **`openrouterAgent.shellFallbacks`** | Extra shell paths if defaults fail |
 | **`openrouterAgent.chatFontSize`** | Chat text size in px (`0` = 14px) |
 | **`openrouterAgent.streamResponses`** | Stream replies token-by-token (default: on) |
+| **`openrouterAgent.showAccountBalance`** | Show OpenRouter balance in the chat composer (default: on) |
 | **`openrouterAgent.maxAttachments`** | Max files/images per message (default: 5) |
 | **`openrouterAgent.maxImageSizeMb`** | Max image size in MB (default: 4) |
 | **`openrouterAgent.maxPdfSizeMb`** | Max PDF size in MB (default: 10) |
 
-**Auto** picks one model per message from your available list (settings + chat-added models), based on mode and what you wrote. Defaults in settings: `z-ai/glm-4.5-air:free`, `openrouter/owl-alpha`.
+**Auto** picks one model per message from models you enable in the chat model menu (teal pool toggles), based on mode and what you wrote.
 
 ### Managing models
 
 | Action | Where |
 |--------|--------|
-| **Default models** (up to 3) | **Settings** → `openrouterAgent.models` |
-| **Add a model** | Chat model dropdown → **Add model…** (saved in extension storage, not shown in Settings) |
-| **Remove a chat-added model** | Chat model dropdown → **Remove model…** |
-| **Remove a Settings model** | Edit or delete its entry in `openrouterAgent.models` |
+| **Pick a model for chat** | Model dropdown → tap a model name |
+| **Build Auto pool** | Model dropdown → turn on **teal switches** (at least 3), then **Enable Auto** |
+| **Disable Auto** | Model dropdown → **Disable Auto**, then pick a model by name |
+| **Browse catalog** | Model dropdown → search, **Free** / **Paid** filters |
 
 ---
 
@@ -176,6 +176,8 @@ Open **Settings** (`Ctrl+,`) and search **`openrouterAgent`**.
 | Chat doesn’t open | Reload window; confirm extension is **Enabled** |
 | **Ctrl+Alt+L** does nothing | Command Palette → **OpenRouter: Open Chat** |
 | “No API key” | **OpenRouter: Set API Key** |
+| **Insufficient credits** on a paid model | Add credits at [openrouter.ai/settings/credits](https://openrouter.ai/settings/credits), or pick a **free** model (`:free` suffix or **Free** filter in the model menu) |
+| Balance badge missing | OpenRouter may not expose balance for your key type; add credits at [openrouter.ai/settings/credits](https://openrouter.ai/settings/credits) or set a per-key credit limit on [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) |
 | Agent can’t run commands | Open a workspace folder; set **`openrouterAgent.shell`** if needed |
 | Wrong files in Ask mode | Open the correct folder; start a **new chat** |
 | Extension feels outdated | Extensions → check for updates, or reload window |

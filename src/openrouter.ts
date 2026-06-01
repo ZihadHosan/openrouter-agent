@@ -1,8 +1,12 @@
-import * as vscode from 'vscode';
 import { AgentMode } from './agent';
 import { pickAutoModelForRequest } from './autoModel';
 import { ApiKeyStore } from './apiKeyStore';
-import { AUTO_MODEL_ID, ModelStore } from './models';
+import {
+  AUTO_MODEL_ID,
+  DEFAULT_POOL_SEED_IDS,
+  MIN_AUTO_POOL_SIZE,
+  ModelStore,
+} from './models';
 
 export type ContentPart =
   | { type: 'text'; text: string }
@@ -56,19 +60,22 @@ interface OpenRouterChoice {
   delta?: { content?: string };
 }
 
+interface OpenRouterErrorMetadata {
+  provider_name?: string;
+  raw?: unknown;
+}
+
 interface OpenRouterResponse {
   choices?: OpenRouterChoice[];
-  error?: { message?: string; code?: number };
+  error?: {
+    message?: string;
+    code?: number;
+    metadata?: OpenRouterErrorMetadata;
+  };
 }
 
 export function getModels(): string[] {
-  const models = vscode.workspace
-    .getConfiguration('openrouterAgent')
-    .get<string[]>('models', [
-      'z-ai/glm-4.5-air:free',
-      'openrouter/owl-alpha',
-    ]);
-  return models.slice(0, 3);
+  return DEFAULT_POOL_SEED_IDS.slice(0, MIN_AUTO_POOL_SIZE);
 }
 
 function buildRequestBody(
@@ -83,7 +90,7 @@ function buildRequestBody(
     return { model: selectedId, messages };
   }
 
-  const available = modelStore?.getAvailableModels() ?? getModels();
+  const available = modelStore?.getAutoPoolModels() ?? getModels();
   if (available.length === 0) {
     return { messages };
   }
@@ -103,17 +110,133 @@ function buildRequestBody(
   return { model: picked, messages };
 }
 
-function formatApiError(parsed: OpenRouterResponse & { message?: string }, status: number, statusText: string): string {
-  const detail =
+/** Pull a human-readable message from OpenRouter error.metadata.raw. */
+function extractRawMessage(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        return extractRawMessage(parsed) ?? trimmed;
+      } catch {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  }
+  if (typeof raw === 'object') {
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.message === 'string' && obj.message.trim()) {
+      return obj.message.trim();
+    }
+    if (obj.error !== undefined) {
+      const nested = extractRawMessage(obj.error);
+      if (nested) {
+        return nested;
+      }
+    }
+    if (typeof obj.detail === 'string' && obj.detail.trim()) {
+      return obj.detail.trim();
+    }
+  }
+  return undefined;
+}
+
+function extractApiErrorDetail(
+  parsed: OpenRouterResponse & { message?: string },
+  status: number,
+  statusText: string
+): string {
+  const top =
     parsed.error?.message ??
     parsed.message ??
     `HTTP ${status} ${statusText}`;
-  let msg = `**API Error:** ${detail}`;
-  if (/image input|vision|multimodal/i.test(detail)) {
-    msg +=
-      '\n\nSwitch to **Auto** or add a vision-capable model (e.g. Gemini Flash, GPT-4o, Claude) via **Add model…**.';
+  const metadata = parsed.error?.metadata;
+  const providerName = metadata?.provider_name?.trim();
+  const rawMsg =
+    metadata?.raw !== undefined ? extractRawMessage(metadata.raw) : undefined;
+
+  if (rawMsg && rawMsg !== top && !top.toLowerCase().includes(rawMsg.toLowerCase())) {
+    return providerName ? `[${providerName}] ${rawMsg}` : rawMsg;
   }
-  return msg;
+  if (providerName && /provider returned error/i.test(top)) {
+    return `[${providerName}] ${top}`;
+  }
+  return top;
+}
+
+function formatModelIdForError(modelId: string): string {
+  return modelId.length > 48 ? modelId.slice(0, 46) + '…' : modelId;
+}
+
+function appendProviderErrorHints(detail: string, status: number): string {
+  if (/image input|vision|multimodal/i.test(detail)) {
+    return (
+      '\n\nSwitch to **Auto** with vision models enabled, or pick a vision-capable model (e.g. Gemini Flash, GPT-4o, Claude) from the model menu.'
+    );
+  }
+
+  const d = detail.toLowerCase();
+  const lines: string[] = ['\n\n**What you can try:**'];
+
+  if (
+    status === 402 ||
+    /credit|balance|billing|payment|insufficient|afford/i.test(d)
+  ) {
+    return (
+      '\n\nPaid models require a positive OpenRouter balance. Free models (names ending in `:free`, or the **Free** filter in the model menu) do not need paid credits the same way.' +
+      '\n\n**What you can try:**' +
+      '\n- This model is **paid** — add credits at [OpenRouter Credits](https://openrouter.ai/settings/credits) or choose a **free** model.' +
+      '\n- Your API key is valid; the account balance is too low for this request.' +
+      '\n- See [OpenRouter Activity](https://openrouter.ai/activity) for the exact charge attempt.'
+    );
+  }
+
+  if (/rate limit|429|too many/i.test(d) || status === 429) {
+    lines.push('- Wait a minute and retry, or switch to another model.');
+    lines.push('- Enable **Auto** with several pool models to spread load.');
+    return lines.join('\n');
+  }
+
+  if (/context|token|length|maximum/i.test(d)) {
+    lines.push('- Shorten your message or start a new chat to reduce history size.');
+    lines.push('- Pick a model with a larger context window.');
+    return lines.join('\n');
+  }
+
+  if (
+    status === 502 ||
+    status === 503 ||
+    status === 529 ||
+    /unavailable|timeout|overloaded/i.test(d)
+  ) {
+    lines.push('- Temporary outage — retry in a minute.');
+    lines.push('- Pick a different model from the model menu.');
+    return lines.join('\n');
+  }
+
+  lines.push('- Pick a different model (this provider may be down for that model).');
+  lines.push('- Enable **Auto** with several models so routing can try another on failure.');
+  lines.push('- Open [OpenRouter Activity](https://openrouter.ai/activity) for the full upstream error.');
+  lines.push('- Retry in a minute if this is a temporary outage.');
+  return lines.join('\n');
+}
+
+function formatApiError(
+  parsed: OpenRouterResponse & { message?: string },
+  status: number,
+  statusText: string,
+  modelId?: string
+): string {
+  const detail = extractApiErrorDetail(parsed, status, statusText);
+  const modelPrefix = modelId ? `(${formatModelIdForError(modelId)}) ` : '';
+  return `**API Error:** ${modelPrefix}${detail}${appendProviderErrorHints(detail, status)}`;
 }
 
 async function readSseStream(
@@ -215,7 +338,7 @@ export async function askOpenRouterWithFallback(
 
     if (attempt > 0 && options.modelStore) {
       // Get available models and try alternate ones
-      const available = options.modelStore.getAvailableModels() ?? getModels();
+      const available = options.modelStore.getAutoPoolModels() ?? getModels();
       const currentModel = options.modelStore.getSelectedModelId();
 
       if (currentModel === AUTO_MODEL_ID && available.length > 1) {
@@ -244,6 +367,7 @@ export async function askOpenRouterWithFallback(
     const isError = result.startsWith('**Error:**') || result.startsWith('**API Error:**') || result.startsWith('**Network Error:**');
     const isRateLimit = /rate limit|429|too many/i.test(result);
     const isServerErr = /5[0-9][0-9]/.test(result);
+    const isProviderErr = /provider returned error/i.test(result);
 
     if (!isError) {
       // Success
@@ -258,7 +382,7 @@ export async function askOpenRouterWithFallback(
     }
 
     // Don't retry for certain errors that won't be fixed by changing models
-    if (!isRateLimit && !isServerErr && !result.includes('model')) {
+    if (!isRateLimit && !isServerErr && !isProviderErr && !result.includes('model')) {
       break;
     }
 
@@ -286,7 +410,7 @@ async function askOpenRouterInternal(
     options.hasVisionAttachments ?? false
   );
   if (!('model' in body) && !('models' in body)) {
-    return '**Error:** No models configured. Add a model in chat or set `openrouterAgent.models` in Settings.';
+    return '**Error:** No models configured. Open the model menu, turn on at least 3 models (teal switches), then Enable Auto — or pick a model by name.';
   }
 
   try {
@@ -315,7 +439,8 @@ async function askOpenRouterInternal(
       } catch {
         /* body may not be JSON */
       }
-      return formatApiError(parsed, response.status, response.statusText);
+      const modelId = typeof body.model === 'string' ? body.model : undefined;
+      return formatApiError(parsed, response.status, response.statusText, modelId);
     }
 
     if (useStream && contentType.includes('text/event-stream')) {

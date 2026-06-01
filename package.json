@@ -2,7 +2,7 @@
   "name": "openrouter-agent",
   "displayName": "OpenRouter Agent",
   "description": "Lightweight AI chat for VS Code and Cursor — Ask, Plan, and Agent modes powered by OpenRouter.",
-  "version": "1.14.1",
+  "version": "1.20.10",
   "publisher": "ZihadHosan",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -91,19 +91,6 @@
     "configuration": {
       "title": "OpenRouter Agent",
       "properties": {
-        "openrouterAgent.models": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "z-ai/glm-4.5-air:free",
-            "openrouter/owl-alpha"
-          ],
-          "markdownDescription": "Models **Auto** can choose from (max 3 in this list). Auto picks one model per request based on **Ask / Plan / Agent** mode and your message. Add more models in chat via **Add model…**.\n\n**API key:** not stored here — use Command Palette → `OpenRouter: Set API Key` (masked, secure storage).",
-          "maxItems": 3,
-          "order": 1
-        },
         "openrouterAgent.agentPermissions": {
           "type": "string",
           "enum": [
@@ -119,14 +106,14 @@
             "Auto-approve reads, writes, and safe commands. Destructive commands always ask."
           ],
           "default": "ask",
-          "markdownDescription": "Control when the agent runs tools without asking. Change quickly via **OpenRouter: Agent Permissions** in the Command Palette.",
-          "order": 2
+          "markdownDescription": "Control when the agent runs tools without asking. Change quickly via **OpenRouter: Agent Permissions** in the Command Palette.\n\n**API key:** Command Palette → `OpenRouter: Set API Key` (secure storage, not settings.json). **Models:** use the chat model menu (catalog + pool toggles), not Settings.",
+          "order": 1
         },
         "openrouterAgent.shell": {
           "type": "string",
           "default": "",
           "markdownDescription": "Primary shell for in-chat commands. **Leave empty** to use VS Code default + built-in fallbacks (PowerShell, Git Bash, cmd, WSL on Windows; bash/zsh/sh on macOS/Linux).",
-          "order": 3
+          "order": 2
         },
         "openrouterAgent.shellFallbacks": {
           "type": "array",
@@ -135,7 +122,7 @@
           },
           "default": [],
           "markdownDescription": "Extra shell paths tried after the default chain. Example: `C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe`",
-          "order": 4
+          "order": 3
         },
         "openrouterAgent.chatFontSize": {
           "type": "number",
@@ -143,13 +130,13 @@
           "minimum": 0,
           "maximum": 24,
           "markdownDescription": "Chat message font size in pixels. **0** uses 14px (readable default for chat prose).",
-          "order": 5
+          "order": 4
         },
         "openrouterAgent.streamResponses": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Stream assistant replies token-by-token in chat. Disable for slower machines or if you prefer instant full messages.",
-          "order": 6
+          "order": 5
         },
         "openrouterAgent.contextGatherTimeoutMs": {
           "type": "number",
@@ -157,13 +144,25 @@
           "minimum": 500,
           "maximum": 10000,
           "markdownDescription": "Max milliseconds to wait for editor/workspace context before sending the request.",
-          "order": 7
+          "order": 6
         },
         "openrouterAgent.debugPerformance": {
           "type": "boolean",
           "default": false,
           "markdownDescription": "Log timing to the **Developer Console** (`[perf]` lines for context gather, API, etc.). Or set environment variable `DEBUG_PERF=1`.",
+          "order": 7
+        },
+        "openrouterAgent.showModelPricing": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show selected model per-million token pricing in the chat composer (from OpenRouter catalog).",
           "order": 8
+        },
+        "openrouterAgent.showAccountBalance": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show OpenRouter credit balance in the top-right of the chat composer when the API returns it (account credits or per-key limit).",
+          "order": 8.25
         },
         "openrouterAgent.maxAttachments": {
           "type": "number",

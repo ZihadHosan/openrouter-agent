@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { AgentMode, ReasoningStep } from './agent';
 import { AttachmentMeta } from './attachments';
-import { AUTO_MODEL_ID } from './models';
+import { DEFAULT_FIRST_MODEL_ID } from './models';
 
 export interface ToolDetailEntry {
   step: number;
@@ -78,7 +78,7 @@ export class ChatHistoryStore {
       createdAt: now,
       updatedAt: now,
       mode: 'ask',
-      modelId: AUTO_MODEL_ID,
+      modelId: DEFAULT_FIRST_MODEL_ID,
       messages: [],
     };
   }

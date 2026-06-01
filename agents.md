@@ -51,6 +51,7 @@ openrouter-agent/
 │   ├── chatView.ts         # Webview UI + message/agent loop (largest file)
 │   ├── agent.ts            # System prompts, context gathering, message building
 │   ├── openrouter.ts       # OpenRouter API client (streaming + non-streaming)
+│   ├── openrouterBalance.ts # Account/key credit balance for composer badge
 │   ├── tools.ts            # Tool parsing, execution, file ops, tool loop helpers
 │   ├── terminalRunner.ts   # Cross-platform shell execution with fallbacks
 │   ├── permissions.ts      # Agent permission modes + auto-approve logic
@@ -172,7 +173,7 @@ This is the **central orchestrator** (~3600 lines). Responsibilities:
 | `switchSession` | Switch active session |
 | `setMode` | Ask / Plan / Agent |
 | `setModel` | Select model or Auto |
-| `promptAddModel` / `promptRemoveModel` | Model management |
+| `setAutoPoolModel` | Toggle model on/off for Auto pool |
 | `pickAttachments` / `addAttachments` / `removeAttachment` | Attachment UI |
 | `toolApprovalResponse` | User approves/skips write or command |
 | `openLink` | Open URL in external browser |
@@ -311,6 +312,7 @@ askOpenRouter(messages, {
 - If user selected a specific model → `{ model, messages }`
 - If **Auto** (`__auto__`) → `pickAutoModelForRequest()` picks one model from available list based on mode, message length, vision need
 - Returns error strings like `**Error:**`, `**API Error:**`, `**Network Error:**` (not thrown)
+- `formatApiError()` reads `error.metadata.raw` and `provider_name` when OpenRouter returns a generic “Provider returned error”; appends situational **What you can try** bullets. Auto mode retries on provider errors via `askOpenRouterWithFallback`.
 
 ### 9.3 Streaming
 
@@ -319,7 +321,13 @@ askOpenRouter(messages, {
 - Calls `onChunk(delta, accumulated)` per token
 - Throws `AskOpenRouterAbortedError` on abort
 
-### 9.4 Headers
+### 9.4 Account balance (`openrouterBalance.ts`)
+
+- `GET /api/v1/credits` → `total_credits - total_usage` when allowed for the stored API key.
+- Fallback `GET /api/v1/key` → `limit_remaining` when the key has a configured limit.
+- Cached 60s; `ChatViewProvider.syncAccountBalance()` posts `accountBalance` to the webview (top-right of composer). Hidden when balance cannot be fetched.
+
+### 9.5 Headers
 
 ```typescript
 Authorization: Bearer <apiKey>
@@ -345,6 +353,8 @@ X-Title: OpenRouter Agent VS Code Extension
 If vision attachments present but **no** vision model in list → returns `null` → UI blocks send with error.
 
 Vision detection: `modelSupportsVision()` in `attachments.ts` (regex on model id).
+
+**Auto pool:** Users enable any number of catalog models via toggles in the model picker (`openrouterAgent.autoPoolEnabled`). Each request scores **all** enabled ids and sends **one** to OpenRouter. With Auto off, the picker lists pool toggles at the top (toggle order) for easier management.
 
 ---
 
@@ -535,11 +545,11 @@ Webview listens for paste events; sends image data to extension via `addAttachme
 
 | Storage | Key | Content |
 |---------|-----|---------|
-| Settings | `openrouterAgent.models` | Up to 3 default models |
-| Global state | `openrouterAgent.customModels` | Models added via “Add model…” in chat |
+| Global state | `openrouterAgent.autoPoolEnabled` | Models toggled on for Auto (chat model menu) |
+| Global state | `openrouterAgent.customModels` | Legacy ids merged on first migration only |
 | Global state | `openrouterAgent.selectedModelId` | Current selection or `__auto__` |
 
-`getAvailableModels()` dedupes settings + custom models.
+First install seeds the Auto pool from `DEFAULT_POOL_SEED_IDS` in `models.ts` (not VS Code Settings).
 
 Special ids:
 
@@ -575,12 +585,12 @@ All under `openrouterAgent.*` in VS Code Settings:
 
 | Setting | Type | Default | Purpose |
 |---------|------|---------|---------|
-| `models` | string[] | 2 free models | Auto pool (max 3) |
 | `agentPermissions` | enum | `ask` | Tool approval level |
 | `shell` | string | `""` | Primary shell override |
 | `shellFallbacks` | string[] | `[]` | Extra shell paths |
 | `chatFontSize` | number | `0` | Chat font px (0 = 14) |
 | `streamResponses` | boolean | `true` | Token streaming |
+| `showAccountBalance` | boolean | `true` | Composer OpenRouter balance badge |
 | `maxAttachments` | number | `5` | Per-message attachment limit |
 | `maxImageSizeMb` | number | `4` | Image size cap |
 | `maxPdfSizeMb` | number | `10` | PDF size cap |

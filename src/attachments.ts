@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { modelSupportsVisionRegex } from './openrouterModels';
 import { ContentPart } from './openrouter';
 
 export type AttachmentKind = 'image' | 'pdf' | 'text';
@@ -122,13 +123,14 @@ export function attachmentAnalysisLabel(attachments: AttachmentMeta[]): string {
   return `${names.length} files`;
 }
 
-export function modelSupportsVision(modelId: string): boolean {
-  const id = modelId.toLowerCase();
-  return (
-    /gemini|gpt-4o|gpt-4\.1|gpt-5|claude|llava|vision|pixtral|qwen-vl|internvl|glm-4v|moondream|llama-3\.2-vision|gpt-4-turbo/.test(
-      id
-    ) || id.includes(':vision')
-  );
+export function modelSupportsVision(
+  modelId: string,
+  catalogSupportsVision?: boolean
+): boolean {
+  if (catalogSupportsVision !== undefined) {
+    return catalogSupportsVision;
+  }
+  return modelSupportsVisionRegex(modelId);
 }
 
 export function buildUserMessageContent(

@@ -655,6 +655,8 @@ export function stripToolBlock(text: string): string {
     .replace(/<[a-zA-Z0-9_-]*(?:tool_call|arg_key|arg_value)[^>]*>/gi, '')
     .replace(/<\/[a-zA-Z0-9_-]*(?:tool_call|arg_key|arg_value)>/gi, '')
     .replace(/```json\s*\n[\s\S]*?"tool"[\s\S]*?```/g, '')
+    .replace(/```tool\s*\n[\s\S]*?```/gi, '')
+    .replace(/```[a-zA-Z0-9_-]*\s*\n\s*```/g, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }

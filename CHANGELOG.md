@@ -9,12 +9,35 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 
 ## [Unreleased]
 
-### Fixed
-- **Tool interruption text in chat** — strip Roo-style `[Response interrupted by a tool use result…]` from streams and replies; retry with correct `agent-tool` format when models emit it without runnable tools.
-- **False "can't access files" in Agent/Ask** — tech-stack and project questions trigger auto-read of `package.json` and `README.md`, broader file-verification rules, and retries when models refuse to call tools without reading the workspace.
+### Added
+- **Composer busy border** — a teal gradient “snake” (~50% of the edge, blunt lead and soft tail) travels slowly on a 1px ring while a prompt runs; static border removed while busy; reduced-motion uses static border only.
+- **Composer balance badge** — shows OpenRouter credit balance (teal when positive, orange at $0) in the top-right of the message box when the API returns account or per-key limit data.
+- **Full OpenRouter model picker** — searchable catalog with **Free** / **Paid** tabs; scrollable menu (~280px). **Auto** mode uses on/off toggles (min 2 models); paid-model tip in the Auto banner.
+- **Composer capability hint** — fixed message above the input when the selected model (or Auto pool) cannot read images/PDFs; hidden for vision-capable models.
+- **Catalog vision detection** — `architecture.input_modalities` from OpenRouter API (regex fallback).
+- **Model pricing in composer** — shows `$X/M input tokens | $Y/M output tokens` (teal numerals) when the panel is wide; collapses to teal **free** / **paid** when narrow (full line in tooltip).
 
 ### Changed
+- **Enable Auto** — disabled button shows a tooltip when fewer than 3 pool models are toggled on.
+- **Settings** — removed `openrouterAgent.models` list (models are managed in the chat model menu only).
+- **Model picker** — Auto pool models (teal switches) always appear at the top of the catalog; clearer why/how Auto copy; removed misleading “Using N models from your pool” status (Auto still scores every pool model and picks one per message).
+- First install defaults to `z-ai/glm-4.5-air:free` with a 2-model Auto pool seeded from settings.
+- Removed **Add model…** / **Remove model…** from chat (use catalog + Auto toggles).
+- Model picker: taller **380px** menu, inline **Free** / **Paid** toggle tags (teal when on, both off = show all), model trigger **88–160px** width.
+- **Auto Enable/Disable** — catalog hidden when Auto is on; tap model name to pick, toggles only for pool; min **3** models to enable Auto; fixes trigger stuck on Auto.
 - System prompts clarify text `agent-tool` format, parallel read tools, and that workspace files are readable via tools.
+
+### Fixed
+- **Assistant message UI** — empty `json` / `tool` code fences no longer render copy-only shells; streaming cursor no longer blinks after the reply finishes (stale render race).
+- **New chat model selection** — new sessions default to the first model (not Auto); Disable Auto works on new chats (no race overwriting the chosen model).
+- **Composer top row** — capability hint shrink-wraps to content; balance vertically centered on the same line; balance refetches after each completed prompt.
+- **Composer layout** — balance badge and vision/text-only hint share a flex top row (no overlap on narrow panels); hint text smaller and orange; compact `$X.XX` balance on narrow composers.
+- **Insufficient credits (HTTP 402)** — clearer chat message for paid models with no OpenRouter balance (402 status + credit keywords); link to [OpenRouter Credits](https://openrouter.ai/settings/credits) and suggest free models.
+- **Provider API errors** — surface upstream details from OpenRouter `error.metadata` when available; append **What you can try** hints; Auto mode retries another pool model on generic provider failures.
+- **Model picker search** — typing no longer stops after one letter (list updates without rebuilding the search field).
+- **Stray line over footer dropdowns** — closed model menu fully hidden when chat opens.
+- **Tool interruption text in chat** — strip Roo-style `[Response interrupted by a tool use result…]` from streams and replies; retry with correct `agent-tool` format when models emit it without runnable tools.
+- **False "can't access files" in Agent/Ask** — tech-stack and project questions trigger auto-read of `package.json` and `README.md`, broader file-verification rules, and retries when models refuse to call tools without reading the workspace.
 
 ---
 

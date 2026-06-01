@@ -59,14 +59,15 @@ function scoreModel(modelId: string, ctx: AutoPickContext, listIndex: number): n
 /** Pick one model; when vision attachments are present, only vision-capable models are considered. */
 export function pickAutoModelForRequest(
   availableModels: string[],
-  ctx: AutoPickContext
+  ctx: AutoPickContext,
+  supportsVisionFn: (modelId: string) => boolean = (id) => modelSupportsVision(id)
 ): string | null {
   const models = availableModels.map((m) => m.trim()).filter(Boolean);
   if (models.length === 0) {
     return null;
   }
   if (ctx.hasVisionAttachments) {
-    const visionOnly = models.filter((m) => modelSupportsVision(m));
+    const visionOnly = models.filter((m) => supportsVisionFn(m));
     if (visionOnly.length === 0) {
       return null;
     }
