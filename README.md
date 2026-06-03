@@ -11,6 +11,7 @@ The free AI coding assistant for VS Code and Cursor. Ask questions about your co
 
 [![VS Marketplace](https://img.shields.io/visual-studio-marketplace/v/ZihadHosan.openrouter-agent?label=VS%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=ZihadHosan.openrouter-agent)
 [![Installs](https://img.shields.io/visual-studio-marketplace/i/ZihadHosan.openrouter-agent)](https://marketplace.visualstudio.com/items?itemName=ZihadHosan.openrouter-agent)
+[![Open VSX](https://img.shields.io/open-vsx/v/ZihadHosan/openrouter-agent?label=Open%20VSX)](https://open-vsx.org/extension/ZihadHosan/openrouter-agent)
 [![Rating](https://img.shields.io/visual-studio-marketplace/stars/ZihadHosan.openrouter-agent)](https://marketplace.visualstudio.com/items?itemName=ZihadHosan.openrouter-agent)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -59,16 +60,22 @@ Most AI coding assistants lock you into one provider, one model, and a monthly s
 
 ## Install
 
-**From the Marketplace (recommended)**
+**VS Code**
+1. Open **Extensions** (`Ctrl+Shift+X`)
+2. Search **OpenRouter Agent** → **Install**
 
-1. Open **Extensions** (`Ctrl+Shift+X` / `Cmd+Shift+X`)
-2. Search **OpenRouter Agent**
-3. Click **Install**, then **Reload** if prompted
+**Cursor**
+1. Open **Extensions** (`Ctrl+Shift+X`)
+2. Search **OpenRouter Agent** → **Install**
+   — or install directly from [Open VSX](https://open-vsx.org/extension/ZihadHosan/openrouter-agent)
 
-Or from the terminal:
-
+**Terminal**
 ```bash
+# VS Code
 code --install-extension ZihadHosan.openrouter-agent
+
+# Cursor
+cursor --install-extension ZihadHosan.openrouter-agent
 ```
 
 **Manual install** (`.vsix` or building from source) → see [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md).

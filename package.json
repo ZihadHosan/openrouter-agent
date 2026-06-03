@@ -2,7 +2,7 @@
   "name": "openrouter-agent",
   "displayName": "OpenRouter Agent — AI Coding Assistant",
   "description": "Free AI coding assistant for VS Code — use Claude, GPT-4, Gemini & 300+ models. Ask, Plan, and Agent modes. No subscription required.",
-  "version": "1.23.0",
+  "version": "1.24.0",
   "publisher": "ZihadHosan",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -205,7 +205,9 @@
     "test:sanitize": "npm run compile && node scripts/test-tool-sanitize.mjs",
     "version:sync": "node scripts/bump-version-on-change.mjs",
     "package:vsix": "npm run compile && npx @vscode/vsce package --allow-missing-repository",
-    "publish:marketplace": "npm run package:vsix && npx @vscode/vsce publish"
+    "publish:marketplace": "npm run package:vsix && npx @vscode/vsce publish",
+    "publish:ovsx": "ovsx publish -p $OVSX_TOKEN",
+    "publish:all": "npm run publish:marketplace && ovsx publish -p $OVSX_TOKEN"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
