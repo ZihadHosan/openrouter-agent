@@ -1,5 +1,9 @@
 # OpenRouter Agent — Free AI Coding Assistant for VS Code
 
+<p align="center">
+  <img src="media/openrouter-agent-ai-vs-code-cursor.png" alt="OpenRouter Agent — Free AI Coding Assistant for VS Code" width="100%" />
+</p>
+
 **Use Claude, GPT-4o, Gemini, DeepSeek, and 300+ AI models directly in VS Code — free.**  
 No subscription. No lock-in. Bring your own [OpenRouter API key](https://openrouter.ai/keys) (free tier available).
 
