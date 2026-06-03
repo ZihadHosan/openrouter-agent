@@ -225,8 +225,8 @@ export class ChatViewProvider {
     );
 
     this.panel.iconPath = {
-      light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'icon-light.svg'),
-      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'icon-dark.svg'),
+      light: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'openrouter-agent-logo', 'logo.svg'),
+      dark: vscode.Uri.joinPath(this.context.extensionUri, 'media', 'openrouter-agent-logo', 'logo.svg'),
     };
 
     this.attachWebview(this.panel.webview);

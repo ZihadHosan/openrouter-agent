@@ -11,6 +11,16 @@ tsconfig.json
 .gitignore
 node_modules/**
 *.vsix
+media/icon.png
 media/icon.svg
 media/icon-light.svg
 media/icon-dark.svg
+media/openrouter-agent-logo/icon-32.png
+media/openrouter-agent-logo/icon-48.png
+media/openrouter-agent-logo/icon-64.png
+media/openrouter-agent-logo/icon-128.png
+media/openrouter-agent-logo/icon-512.png
+publish.md
+CONTRIBUTING.md
+agents.md
+.claude/**
