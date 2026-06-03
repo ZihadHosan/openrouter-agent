@@ -1,5 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import type { AgentMode } from './agent';
+import type { NativeToolCall, OpenRouterToolDef } from './openrouter';
 import type { ApprovalRequest, PermissionChoice } from './approvalBridge';
 import {
   rememberApproval,
@@ -18,6 +20,18 @@ import {
   getToolResultCache,
   type ToolResultCache,
 } from './toolResultCache';
+import {
+  hasNativeControlTokens,
+  normalizeModelToolSyntax,
+  stripHarmonyControlTokens,
+} from './harmonyTokens';
+
+export {
+  hasNativeControlTokens,
+  isHarmonyControlToken,
+  normalizeModelToolSyntax,
+  stripHarmonyControlTokens,
+} from './harmonyTokens';
 
 export interface ToolHandlerContext {
   onPropose: (description: string) => void;
@@ -129,9 +143,10 @@ export function detectUserFileIntent(userText: string): UserFileIntent {
   const text = userText.trim();
 
   if (
-    /\b(tech\s*stack|technologies|what\s+(?:is|does)\s+this\s+project|this\s+project\s+use|project\s+use|built\s+with|dependencies)\b/i.test(
+    /\b(tech\s*stack|technologies|what\s+(?:is|does)\s+this\s+project|this\s+project\s+use|project\s+use|built\s+with|dependencies|database|cms|backend|connected|integration|api|orm|prisma|wordpress|strapi)\b/i.test(
       text
-    )
+    ) ||
+    /\bhow\b[\s\S]{0,48}\b(connect|connected|integration)\b/i.test(text)
   ) {
     return { kind: 'explore_project_stack' };
   }
@@ -172,6 +187,7 @@ export function buildAutoToolCalls(intent: UserFileIntent): ToolCall[] {
   switch (intent.kind) {
     case 'explore_project_stack':
       return [
+        { tool: 'list_files', pattern: '**/*', maxResults: 100 },
         { tool: 'read_file', path: 'package.json' },
         { tool: 'read_file', path: 'README.md' },
       ];
@@ -192,6 +208,28 @@ export function buildAutoToolCalls(intent: UserFileIntent): ToolCall[] {
 export function buildAutoToolCall(intent: UserFileIntent): ToolCall | null {
   return buildAutoToolCalls(intent)[0] ?? null;
 }
+
+/** Default read bundle when verification is required but the model never ran tools. */
+export function buildVerificationFallbackTools(userText: string): ToolCall[] {
+  const fromIntent = buildAutoToolCalls(detectUserFileIntent(userText));
+  if (fromIntent.length > 0) {
+    return fromIntent;
+  }
+  if (!requiresFileVerification(userText)) {
+    return [];
+  }
+  return [
+    { tool: 'list_files', pattern: '**/*', maxResults: 100 },
+    { tool: 'read_file', path: 'package.json' },
+    { tool: 'read_file', path: 'README.md' },
+  ];
+}
+
+export const VERIFICATION_TOOLS_FAILED_MESSAGE =
+  '_The model did not run readable workspace tools, so files could not be verified. Try again, use a model that emits complete ```agent-tool``` JSON blocks, or send again — the extension can auto-read key project files._';
+
+export const TOOL_PARSE_FAILED_MESSAGE =
+  '_Could not parse a tool call from the model. Use a complete ```agent-tool``` block, for example:\n```agent-tool\n{"tool":"list_files","pattern":"**/*"}\n```_';
 
 export function isProjectStackQuestion(userText: string): boolean {
   return detectUserFileIntent(userText).kind === 'explore_project_stack';
@@ -308,42 +346,55 @@ export function isReadOnlyTool(tool: string): boolean {
 }
 
 export function hasToolCallMarkup(text: string): boolean {
+  if (hasNativeControlTokens(text)) {
+    return true;
+  }
   const normalized = normalizeModelToolSyntax(text);
   return (
     /```agent-tool/i.test(text) ||
     /<[a-zA-Z0-9_-]*tool_call>/i.test(text) ||
-    /function_call_begin|function_calls_begin/i.test(normalized) ||
+    /function_call_begin|function_calls_begin|tool_call_begin|tool_calls_section/i.test(
+      normalized
+    ) ||
     /\{[\s\S]*?"(?:tool|name|path|pattern)"\s*:\s*"/i.test(text)
   );
 }
 
-/** Collapse spaced pipe tokens: `< | function_call_begin | >` → `<|function_call_begin|>`. */
-export function normalizeModelToolSyntax(text: string): string {
-  return text.replace(/<\s*\|\s*([^|>]+?)\s*\|\s*>/g, '<|$1|>');
+/** Map Harmony wire names (e.g. functions.list_files:0) to extension tool ids. */
+export function normalizeHarmonyToolName(raw: string): string {
+  let name = raw.trim();
+  if (name.toLowerCase().startsWith('functions.')) {
+    name = name.slice('functions.'.length);
+  }
+  name = name.replace(/:\d+$/, '');
+  const key = normalizeToolName(name);
+  return TOOL_ALIASES[key] ?? key;
 }
 
 /** Remove harmony/channel delimiters (e.g. openrouter/owl-alpha `<|channel|>final<|message|>`). */
 export function sanitizeModelOutput(text: string): string {
   const normalized = stripToolInterruptionArtifacts(normalizeModelToolSyntax(text));
+  let result: string;
   if (!/<\|channel\|>/i.test(normalized)) {
-    return normalized;
+    result = normalized;
+  } else {
+    const finalParts: string[] = [];
+    const finalRe = /<\|channel\|>final<\|message\|>([\s\S]*?)(?=<\|channel\|>|$)/gi;
+    let match: RegExpExecArray | null;
+    while ((match = finalRe.exec(normalized)) !== null) {
+      finalParts.push(match[1]);
+    }
+    if (finalParts.length > 0) {
+      result = finalParts.join('\n\n').trim();
+    } else {
+      result = normalized
+        .replace(/<\|channel\|>[^<\n]*<\|message\|>/gi, '')
+        .replace(/<\|end\|>/gi, '')
+        .replace(/<\|start\|>/gi, '')
+        .trim();
+    }
   }
-
-  const finalParts: string[] = [];
-  const finalRe = /<\|channel\|>final<\|message\|>([\s\S]*?)(?=<\|channel\|>|$)/gi;
-  let match: RegExpExecArray | null;
-  while ((match = finalRe.exec(normalized)) !== null) {
-    finalParts.push(match[1]);
-  }
-  if (finalParts.length > 0) {
-    return finalParts.join('\n\n').trim();
-  }
-
-  return normalized
-    .replace(/<\|channel\|>[^<\n]*<\|message\|>/gi, '')
-    .replace(/<\|end\|>/gi, '')
-    .replace(/<\|start\|>/gi, '')
-    .trim();
+  return stripHarmonyControlTokens(result);
 }
 
 function jsonObjectToStrArgs(obj: Record<string, unknown>): Record<string, string> {
@@ -368,7 +419,7 @@ function parseFunctionCallMatch(toolRaw: string, jsonStr: string): ToolCall | nu
       (typeof obj.tool === 'string' && obj.tool) ||
       (typeof obj.name === 'string' && obj.name) ||
       '';
-    const tool = normalizeToolName(toolFromJson || toolRaw);
+    const tool = normalizeHarmonyToolName(toolFromJson || toolRaw);
     return mapArgsToToolCall(tool, jsonObjectToStrArgs(obj));
   } catch {
     return null;
@@ -485,36 +536,116 @@ function parseAllXmlToolCalls(text: string): ToolCall[] {
   return results;
 }
 
+function tryParseAgentToolJsonPayload(payload: string): ToolCall | null {
+  const trimmed = payload.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    const obj = JSON.parse(trimmed) as Record<string, unknown>;
+    return parseJsonToolObject(obj);
+  } catch {
+    const jsonMatch = trimmed.match(/\{[\s\S]*?"(?:tool|name)"\s*:\s*"[\w_-]+"[\s\S]*?\}/);
+    if (!jsonMatch) {
+      return null;
+    }
+    try {
+      const obj = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+      return parseJsonToolObject(obj);
+    } catch {
+      return null;
+    }
+  }
+}
+
 function parseAllAgentToolBlocks(text: string): ToolCall[] {
   const results: ToolCall[] = [];
-  const re = /```agent-tool\s*\n([\s\S]*?)```/gi;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    try {
-      const obj = JSON.parse(match[1].trim()) as Record<string, unknown>;
-      const call = parseJsonToolObject(obj);
+  const fencePatterns = [
+    /```agent-tool\s*\n([\s\S]*?)```/gi,
+    /```agent-tool[^\n]*\n([\s\S]*?)```/gi,
+    /```agent\s*\n([\s\S]*?)```/gi,
+    /```agent\s*\n([\s\S]*?)$/gi,
+  ];
+  for (const re of fencePatterns) {
+    re.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(text)) !== null) {
+      const call = tryParseAgentToolJsonPayload(match[1]);
       if (call) {
         results.push(call);
       }
-    } catch {
-      /* skip malformed block */
     }
-  }
-  if (results.length > 0) {
-    return results;
+    if (results.length > 0) {
+      return results;
+    }
   }
   const inline = text.match(/\{[\s\S]*?"(?:tool|name)"\s*:\s*"[\w_-]+"[\s\S]*?\}/);
   if (!inline) {
     return results;
   }
-  try {
-    const obj = JSON.parse(inline[0]) as Record<string, unknown>;
-    const call = parseJsonToolObject(obj);
+  const call = tryParseAgentToolJsonPayload(inline[0]);
+  if (call) {
+    results.push(call);
+  }
+  return results;
+}
+
+function extractToolCallsFromSegment(body: string): ToolCall[] {
+  const merged: ToolCall[] = [];
+  for (const raw of [
+    ...parseHarmonyToolCallsFormat(body),
+    ...parseAllFunctionCallsFormat(body),
+    ...parseAllAgentToolBlocks(body),
+  ]) {
+    const resolved = resolveKnownToolCall(raw);
+    if (resolved) {
+      merged.push(resolved);
+    }
+  }
+  return merged;
+}
+
+function dedupeToolCalls(calls: ToolCall[]): ToolCall[] {
+  const seen = new Set<string>();
+  const out: ToolCall[] = [];
+  for (const c of calls) {
+    const key = `${c.tool}\0${c.path ?? ''}\0${c.pattern ?? ''}\0${c.command ?? ''}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
+}
+
+/** Parse tools inside each Harmony channel body (owl-alpha, etc.). */
+function parseHarmonyChannelToolCalls(text: string): ToolCall[] {
+  const normalized = normalizeModelToolSyntax(text);
+  if (!/<\|channel\|>/i.test(normalized)) {
+    return [];
+  }
+  const results: ToolCall[] = [];
+  const channelRe = /<\|channel\|>([^<]+)<\|message\|>([\s\S]*?)(?=<\|channel\|>|$)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = channelRe.exec(normalized)) !== null) {
+    results.push(...extractToolCallsFromSegment(match[2]));
+  }
+  return dedupeToolCalls(results);
+}
+
+/** Kimi / Harmony tool_call_begin + tool_call_argument_begin blocks. */
+function parseHarmonyToolCallsFormat(text: string): ToolCall[] {
+  const normalized = normalizeModelToolSyntax(text);
+  const results: ToolCall[] = [];
+  const callRe =
+    /<\|(?:redacted_)?tool_call_begin[\w-]*\|>\s*(?:functions\.)?([\w.]+)(?::\d+)?\s*<\|(?:redacted_)?tool_call_argument_begin\|>\s*(\{[\s\S]*?\})(?:\s*<\|(?:redacted_)?tool_call_end[\w-]*\|>)?/gi;
+  let match: RegExpExecArray | null;
+  while ((match = callRe.exec(normalized)) !== null) {
+    const call = parseFunctionCallMatch(match[1], match[2]);
     if (call) {
       results.push(call);
     }
-  } catch {
-    /* skip malformed inline JSON */
   }
   return results;
 }
@@ -590,22 +721,34 @@ function parseXmlToolCallLoose(text: string): ToolCall | null {
   return mapArgsToToolCall(tool, args);
 }
 
+function resolveKnownToolCalls(calls: ToolCall[]): ToolCall[] {
+  return calls
+    .map((c) => resolveKnownToolCall(c))
+    .filter((c): c is ToolCall => c !== null);
+}
+
 /** Parse every tool call in model output (same format priority as parseToolCall). */
 export function parseAllToolCalls(text: string): ToolCall[] {
   const normalized = normalizeModelToolSyntax(text);
 
-  const fromFunctions = parseAllFunctionCallsFormat(normalized);
-  if (fromFunctions.length > 0) {
-    return fromFunctions
-      .map((c) => resolveKnownToolCall(c))
-      .filter((c): c is ToolCall => c !== null);
+  const fromChannels = parseHarmonyChannelToolCalls(normalized);
+  if (fromChannels.length > 0) {
+    return fromChannels;
   }
 
-  const fromAgentBlocks = parseAllAgentToolBlocks(normalized);
+  const fromHarmony = resolveKnownToolCalls(parseHarmonyToolCallsFormat(normalized));
+  if (fromHarmony.length > 0) {
+    return fromHarmony;
+  }
+
+  const fromFunctions = resolveKnownToolCalls(parseAllFunctionCallsFormat(normalized));
+  if (fromFunctions.length > 0) {
+    return fromFunctions;
+  }
+
+  const fromAgentBlocks = resolveKnownToolCalls(parseAllAgentToolBlocks(normalized));
   if (fromAgentBlocks.length > 0) {
-    return fromAgentBlocks
-      .map((c) => resolveKnownToolCall(c))
-      .filter((c): c is ToolCall => c !== null);
+    return fromAgentBlocks;
   }
 
   const openAi = parseOpenAiFunctionFormat(normalized);
@@ -614,11 +757,9 @@ export function parseAllToolCalls(text: string): ToolCall[] {
     return resolved ? [resolved] : [];
   }
 
-  const fromXml = parseAllXmlToolCalls(normalized);
+  const fromXml = resolveKnownToolCalls(parseAllXmlToolCalls(normalized));
   if (fromXml.length > 0) {
-    return fromXml
-      .map((c) => resolveKnownToolCall(c))
-      .filter((c): c is ToolCall => c !== null);
+    return fromXml;
   }
 
   const loose = parseXmlToolCallLoose(normalized);
@@ -630,6 +771,136 @@ export function parseToolCall(text: string): ToolCall | null {
   return parseAllToolCalls(text)[0] ?? null;
 }
 
+/** OpenRouter/OpenAI-style native function schemas for the tools this extension runs. */
+const NATIVE_TOOL_DEFS: Record<string, OpenRouterToolDef> = {
+  list_files: {
+    type: 'function',
+    function: {
+      name: 'list_files',
+      description:
+        'List file paths in the workspace matching a glob. Use "**/*.md" (not "*.md") to search subfolders. Returns relative paths.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: {
+            type: 'string',
+            description: 'Glob pattern, e.g. "**/*" or "src/**/*.ts". Defaults to "**/*".',
+          },
+          maxResults: { type: 'number', description: 'Max paths to return (default 200).' },
+        },
+        required: [],
+      },
+    },
+  },
+  read_file: {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read one workspace file. Returns its text content (truncated if very large).',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path relative to the workspace root.' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  read_glob: {
+    type: 'function',
+    function: {
+      name: 'read_glob',
+      description:
+        'List and read many files at once. Use "**/" for subfolders, e.g. "**/*.md". Returns each path with its content.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Glob pattern, e.g. "**/*.ts".' },
+          maxFiles: { type: 'number', description: 'Max files to read (default 25).' },
+        },
+        required: ['pattern'],
+      },
+    },
+  },
+  propose_write_file: {
+    type: 'function',
+    function: {
+      name: 'propose_write_file',
+      description:
+        'Propose writing a file (creates or overwrites). The user must approve before it is written. Provide the FULL file text.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path relative to the workspace root.' },
+          content: { type: 'string', description: 'Complete new file content.' },
+        },
+        required: ['path', 'content'],
+      },
+    },
+  },
+  run_command: {
+    type: 'function',
+    function: {
+      name: 'run_command',
+      description:
+        'Run a terminal command in the workspace. The user must approve before it runs. Long-running dev servers auto-detect; pass background:true to keep one running.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'The shell command to run.' },
+          cwd: { type: 'string', description: 'Optional subfolder (relative to workspace root).' },
+          background: {
+            type: 'boolean',
+            description: 'Run detached (for dev servers / watchers).',
+          },
+        },
+        required: ['command'],
+      },
+    },
+  },
+};
+
+/** Native tool schemas to advertise for a given mode (empty in plan mode). */
+export function getToolDefsForMode(
+  mode: AgentMode,
+  allowWrites: boolean
+): OpenRouterToolDef[] {
+  if (mode === 'plan') {
+    return [];
+  }
+  const defs = [
+    NATIVE_TOOL_DEFS.list_files,
+    NATIVE_TOOL_DEFS.read_file,
+    NATIVE_TOOL_DEFS.read_glob,
+  ];
+  if (mode === 'agent' && allowWrites) {
+    defs.push(NATIVE_TOOL_DEFS.propose_write_file, NATIVE_TOOL_DEFS.run_command);
+  }
+  return defs;
+}
+
+/** Convert one native (OpenRouter/OpenAI) tool call into a known ToolCall, or null. */
+export function parseNativeToolCall(tc: NativeToolCall): ToolCall | null {
+  const name = tc.function?.name;
+  if (!name) {
+    return null;
+  }
+  const tool = normalizeHarmonyToolName(name);
+  let argsObj: Record<string, unknown> = {};
+  const rawArgs = tc.function?.arguments;
+  if (rawArgs && rawArgs.trim()) {
+    try {
+      const parsed = JSON.parse(rawArgs) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        argsObj = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* malformed arguments — fall through with empty args */
+    }
+  }
+  return resolveKnownToolCall(mapArgsToToolCall(tool, jsonObjectToStrArgs(argsObj)));
+}
+
 /** True when two or more read-only tools can run concurrently. */
 export function canParallelizeReadTools(calls: ToolCall[]): boolean {
   return calls.length >= 2 && calls.every((c) => isReadOnlyTool(c.tool));
@@ -637,15 +908,26 @@ export function canParallelizeReadTools(calls: ToolCall[]): boolean {
 
 export function stripToolBlock(text: string): string {
   const normalized = sanitizeModelOutput(text);
-  return normalized
+  return stripHarmonyControlTokens(
+    normalized
     .replace(/```agent-tool\s*\n[\s\S]*?```/gi, '')
     .replace(/```agent-tool[^\n]*\n[\s\S]*?```/gi, '')
     .replace(/```\s*agent-tool[\s\S]*?```/gi, '')
+    .replace(/```agent\s*\n[\s\S]*?(?:```|$)/gi, '')
     .replace(/^\s*\{"tool"\s*:\s*"[\w-]+"[\s\S]*?\}\s*$/gm, '')
     .replace(/^\s*\{[\s\S]*?"tool"\s*:\s*"[\w-]+"[\s\S]*?\}\s*$/gm, '')
     .replace(/<\|function_calls_begin\|>[\s\S]*?<\|function_calls_end\|>/gi, '')
     .replace(/<\|function_call_begin\|>[\s\S]*?<\|function_call_end\|>/gi, '')
     .replace(/<\|function_call_begin\|>[\s\S]*?<\|function_sep\|>\s*\{[\s\S]*?\}/gi, '')
+    .replace(
+      /<\|(?:redacted_)?(?:tool_calls|function_calls)_section_begin\|>[\s\S]*?<\|(?:redacted_)?(?:tool_calls|function_calls)_section_end\|>/gi,
+      ''
+    )
+    .replace(
+      /<\|(?:redacted_)?tool_call_begin[\w-]*\|>[\s\S]*?<\|(?:redacted_)?tool_call_argument_begin\|>\s*\{[\s\S]*?\}/gi,
+      ''
+    )
+    .replace(/<\|(?:redacted_)?tool_call_argument_begin\|>[\s\S]*?(?=<\||$)/gi, '')
     .replace(/<[a-zA-Z0-9_-]*tool_call>[\s\S]*?<\/[a-zA-Z0-9_-]*tool_call>/gi, '')
     .replace(
       /<[a-zA-Z0-9_-]*tool_call>[\s\S]*?(?=<[a-zA-Z0-9_-]*tool_call>|$)/gi,
@@ -658,12 +940,13 @@ export function stripToolBlock(text: string): string {
     .replace(/```tool\s*\n[\s\S]*?```/gi, '')
     .replace(/```[a-zA-Z0-9_-]*\s*\n\s*```/g, '')
     .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .trim()
+  );
 }
 
 export function cleanAssistantVisibleText(text: string): string {
   const stripped = stripToolInterruptionArtifacts(stripToolBlock(text));
-  if (!stripped || hasToolCallMarkup(stripped)) {
+  if (!stripped || hasToolCallMarkup(stripped) || hasNativeControlTokens(stripped)) {
     return '';
   }
   return stripped;
@@ -998,6 +1281,30 @@ async function findFileCaseInsensitive(
     return null;
   }
   return null;
+}
+
+/**
+ * Resolve a workspace-relative or bare file reference to an existing file.
+ * Returns the canonical workspace-relative path + uri, or null if it does not exist
+ * (or is outside the workspace). Reused by the chat UI to linkify real file mentions.
+ */
+export async function resolveExistingWorkspaceFile(
+  filePath: string
+): Promise<{ uri: vscode.Uri; relative: string } | null> {
+  const trimmed = (filePath || '').trim();
+  if (!trimmed) {
+    return null;
+  }
+  const uri = await resolveReadableFileUri(trimmed);
+  if (!uri) {
+    return null;
+  }
+  const root = getWorkspaceRoot();
+  if (!root) {
+    return null;
+  }
+  const relative = path.relative(root.fsPath, uri.fsPath).replace(/\\/g, '/');
+  return { uri, relative };
 }
 
 export async function confirmWriteFile(

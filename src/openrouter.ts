@@ -15,9 +15,38 @@ export type ContentPart =
 
 export type MessageContent = string | ContentPart[];
 
+/** Native (OpenRouter/OpenAI) function call returned by tool-capable models. */
+export interface NativeToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+  /** Streaming-assembly index (present only on streamed deltas). */
+  index?: number;
+}
+
+/** Native function/tool schema advertised in the request. */
+export interface OpenRouterToolDef {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: MessageContent;
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: MessageContent | null;
+  /** Present on assistant turns that requested native tool calls. */
+  tool_calls?: NativeToolCall[];
+  /** Present on role:'tool' result messages. */
+  tool_call_id?: string;
+}
+
+/** Content + any native tool calls the model requested this turn. */
+export interface ToolAwareResult {
+  content: string;
+  toolCalls?: NativeToolCall[];
 }
 
 export interface AskOpenRouterOptions {
@@ -28,10 +57,19 @@ export interface AskOpenRouterOptions {
   signal?: AbortSignal;
   stream?: boolean;
   onChunk?: (delta: string, accumulated: string) => void;
+  /** Native tool schemas to advertise (sent only to tool-capable models). */
+  tools?: OpenRouterToolDef[];
+  /** Predicate gating whether the chosen model gets the native `tools` array. */
+  supportsTools?: (modelId: string) => boolean;
+  /** Progress while a native tool call's arguments stream in (e.g. a large file write). */
+  onToolProgress?: (info: { name?: string; bytes: number }) => void;
 }
 
 /** Extract plain text from message content for heuristics and history display. */
-export function messageContentToText(content: MessageContent): string {
+export function messageContentToText(content: MessageContent | null): string {
+  if (content === null) {
+    return '';
+  }
   if (typeof content === 'string') {
     return content;
   }
@@ -55,9 +93,17 @@ export function isAskOpenRouterAborted(err: unknown): boolean {
   );
 }
 
+interface StreamToolCallDelta {
+  index?: number;
+  id?: string;
+  type?: string;
+  function?: { name?: string; arguments?: string };
+}
+
 interface OpenRouterChoice {
-  message?: { content?: string };
-  delta?: { content?: string };
+  message?: { content?: string | null; tool_calls?: NativeToolCall[] };
+  delta?: { content?: string | null; tool_calls?: StreamToolCallDelta[] };
+  finish_reason?: string;
 }
 
 interface OpenRouterErrorMetadata {
@@ -78,16 +124,38 @@ export function getModels(): string[] {
   return DEFAULT_POOL_SEED_IDS.slice(0, MIN_AUTO_POOL_SIZE);
 }
 
+/** Attach the native `tools` array when the chosen model supports it. */
+function attachTools(
+  body: Record<string, unknown>,
+  finalModel: string | undefined,
+  options: Pick<AskOpenRouterOptions, 'tools' | 'supportsTools'>
+): Record<string, unknown> {
+  const tools = options.tools;
+  if (!tools || tools.length === 0 || !finalModel) {
+    return body;
+  }
+  if (options.supportsTools && !options.supportsTools(finalModel)) {
+    return body;
+  }
+  body.tools = tools;
+  body.tool_choice = 'auto';
+  return body;
+}
+
 function buildRequestBody(
   messages: ChatMessage[],
-  modelStore?: ModelStore,
-  mode: AgentMode = 'ask',
-  hasVisionAttachments = false
+  options: Pick<
+    AskOpenRouterOptions,
+    'modelStore' | 'mode' | 'hasVisionAttachments' | 'tools' | 'supportsTools'
+  >
 ): Record<string, unknown> {
+  const modelStore = options.modelStore;
+  const mode = options.mode ?? 'ask';
+  const hasVisionAttachments = options.hasVisionAttachments ?? false;
   const selectedId = modelStore?.getSelectedModelId() ?? AUTO_MODEL_ID;
 
   if (selectedId !== AUTO_MODEL_ID) {
-    return { model: selectedId, messages };
+    return attachTools({ model: selectedId, messages }, selectedId, options);
   }
 
   const available = modelStore?.getAutoPoolModels() ?? getModels();
@@ -107,7 +175,7 @@ function buildRequestBody(
   if (!picked) {
     return { messages };
   }
-  return { model: picked, messages };
+  return attachTools({ model: picked, messages }, picked, options);
 }
 
 /** Pull a human-readable message from OpenRouter error.metadata.raw. */
@@ -239,11 +307,56 @@ function formatApiError(
   return `**API Error:** ${modelPrefix}${detail}${appendProviderErrorHints(detail, status)}`;
 }
 
+/**
+ * Merge streamed tool-call fragments into an index-keyed accumulator.
+ * OpenRouter/OpenAI stream tool calls as partial deltas: the id/name arrive once,
+ * the JSON `arguments` string arrives in pieces that must be concatenated by index.
+ * Pure (no I/O) so it can be unit-tested.
+ */
+export function assembleToolCallDeltas(
+  acc: Map<number, NativeToolCall>,
+  deltas: StreamToolCallDelta[] | undefined
+): void {
+  if (!deltas) {
+    return;
+  }
+  for (const d of deltas) {
+    const index = d.index ?? 0;
+    let entry = acc.get(index);
+    if (!entry) {
+      entry = { id: d.id ?? '', type: 'function', function: { name: '', arguments: '' }, index };
+      acc.set(index, entry);
+    }
+    if (d.id) {
+      entry.id = d.id;
+    }
+    if (d.function?.name) {
+      entry.function.name = d.function.name;
+    }
+    if (d.function?.arguments) {
+      entry.function.arguments += d.function.arguments;
+    }
+  }
+}
+
+/** Flatten the accumulator into ordered, complete tool calls (filling missing ids). */
+export function finalizeToolCalls(acc: Map<number, NativeToolCall>): NativeToolCall[] {
+  return [...acc.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([index, v]) => ({
+      id: v.id || `call_${index}`,
+      type: 'function' as const,
+      function: { name: v.function.name, arguments: v.function.arguments },
+    }))
+    .filter((tc) => tc.function.name.length > 0);
+}
+
 async function readSseStream(
   response: Response,
   signal: AbortSignal | undefined,
-  onChunk: (delta: string, accumulated: string) => void
-): Promise<string> {
+  onChunk: (delta: string, accumulated: string) => void,
+  onToolProgress?: (info: { name?: string; bytes: number }) => void
+): Promise<ToolAwareResult> {
   const reader = response.body?.getReader();
   if (!reader) {
     throw new Error('No response body');
@@ -252,6 +365,23 @@ async function readSseStream(
   const decoder = new TextDecoder();
   let buffer = '';
   let accumulated = '';
+  let finished = false;
+  const toolAcc = new Map<number, NativeToolCall>();
+
+  const emitToolProgress = (): void => {
+    if (!onToolProgress || toolAcc.size === 0) {
+      return;
+    }
+    let bytes = 0;
+    let name: string | undefined;
+    for (const tc of toolAcc.values()) {
+      bytes += tc.function.arguments.length;
+      if (tc.function.name) {
+        name = tc.function.name;
+      }
+    }
+    onToolProgress({ name, bytes });
+  };
 
   while (true) {
     if (signal?.aborted) {
@@ -280,30 +410,91 @@ async function readSseStream(
 
       try {
         const parsed = JSON.parse(data) as OpenRouterResponse;
-        const delta =
-          parsed.choices?.[0]?.delta?.content ??
-          parsed.choices?.[0]?.message?.content;
+        const choice = parsed.choices?.[0];
+        const delta = choice?.delta?.content ?? choice?.message?.content;
         if (typeof delta === 'string' && delta.length > 0) {
           accumulated += delta;
           onChunk(delta, accumulated);
+        }
+        const beforeSize = toolAcc.size;
+        let beforeBytes = 0;
+        for (const tc of toolAcc.values()) {
+          beforeBytes += tc.function.arguments.length;
+        }
+        assembleToolCallDeltas(toolAcc, choice?.delta?.tool_calls);
+        // Some providers send a full message.tool_calls in a single SSE frame.
+        if (choice?.message?.tool_calls?.length) {
+          assembleToolCallDeltas(
+            toolAcc,
+            choice.message.tool_calls.map((tc, i) => ({
+              index: tc.index ?? i,
+              id: tc.id,
+              function: tc.function,
+            }))
+          );
+        }
+        let afterBytes = 0;
+        for (const tc of toolAcc.values()) {
+          afterBytes += tc.function.arguments.length;
+        }
+        if (toolAcc.size !== beforeSize || afterBytes !== beforeBytes) {
+          emitToolProgress();
+        }
+        // Generation finished. Many providers (e.g. owl-alpha) emit finish_reason
+        // but keep the HTTP stream open for many seconds before [DONE]; stop now —
+        // no displayed content comes after finish_reason, so this is lossless.
+        if (choice?.finish_reason) {
+          finished = true;
         }
       } catch {
         /* skip malformed SSE chunk */
       }
     }
+
+    // Harmony turn-end token also marks completion (lossless: we only ever render
+    // the final channel, and nothing the user sees follows <|return|>).
+    if (!finished && TURN_END_RE.test(accumulated)) {
+      finished = true;
+    }
+    if (finished) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* already closing */
+      }
+      break;
+    }
   }
 
-  return accumulated;
+  const toolCalls = finalizeToolCalls(toolAcc);
+  return {
+    content: accumulated,
+    toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+  };
 }
 
-async function readJsonCompletion(response: Response): Promise<string> {
+async function readJsonCompletion(response: Response): Promise<ToolAwareResult> {
   const parsed = (await response.json()) as OpenRouterResponse & { message?: string };
-  const content = parsed.choices?.[0]?.message?.content;
-  if (content === undefined || content === null) {
-    return '**Error:** OpenRouter returned an empty response.';
+  const choice = parsed.choices?.[0];
+  const content = choice?.message?.content;
+  const rawToolCalls = choice?.message?.tool_calls;
+  const toolCalls =
+    rawToolCalls && rawToolCalls.length > 0
+      ? rawToolCalls.map((tc, i) => ({
+          id: tc.id || `call_${i}`,
+          type: 'function' as const,
+          function: tc.function,
+        }))
+      : undefined;
+
+  if ((content === undefined || content === null) && !toolCalls) {
+    return { content: '**Error:** OpenRouter returned an empty response.' };
   }
-  return content;
+  return { content: content ?? '', toolCalls };
 }
+
+/** Harmony end-of-turn token (handles spaced pipe variants) — signals the model is done. */
+const TURN_END_RE = /<\s*\|\s*return\s*\|\s*>/i;
 
 // Maximum number of retry attempts (including initial attempt)
 const MAX_RETRY_ATTEMPTS = 3;
@@ -311,20 +502,29 @@ const MAX_RETRY_ATTEMPTS = 3;
 // Base delay in milliseconds for exponential backoff
 const BACKOFF_BASE_MS = 500;
 
+function isErrorContent(content: string): boolean {
+  return (
+    content.startsWith('**Error:**') ||
+    content.startsWith('**API Error:**') ||
+    content.startsWith('**Network Error:**')
+  );
+}
+
 /**
- * Ask OpenRouter with model fallback on error
- * Automatically retries with alternate models when using Auto mode
+ * Ask OpenRouter with model fallback on error, returning content + any native
+ * tool calls the model requested. Automatically retries alternate models in Auto.
  */
-export async function askOpenRouterWithFallback(
+export async function askOpenRouterToolAware(
   messages: ChatMessage[],
   options: AskOpenRouterOptions
-): Promise<string> {
+): Promise<ToolAwareResult> {
   const apiKey = await options.apiKeyStore.get();
   if (!apiKey) {
-    return (
-      '**Error:** No API key configured. Run **OpenRouter: Set API Key** from the Command Palette ' +
-      '(Ctrl+Shift+P). Get a key at https://openrouter.ai/keys'
-    );
+    return {
+      content:
+        '**Error:** No API key configured. Run **OpenRouter: Set API Key** from the Command Palette ' +
+        '(Ctrl+Shift+P). Get a key at https://openrouter.ai/keys',
+    };
   }
 
   const useStream = !!(options.stream && options.onChunk);
@@ -333,7 +533,7 @@ export async function askOpenRouterWithFallback(
   // Try up to MAX_RETRY_ATTEMPTS times with different models
   for (let attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
     // If this is a retry, try a different model
-    let currentMessages = messages;
+    const currentMessages = messages;
     let currentOptions = { ...options };
 
     if (attempt > 0 && options.modelStore) {
@@ -364,17 +564,17 @@ export async function askOpenRouterWithFallback(
     );
 
     // Check if result is an error that warrants a retry
-    const isError = result.startsWith('**Error:**') || result.startsWith('**API Error:**') || result.startsWith('**Network Error:**');
-    const isRateLimit = /rate limit|429|too many/i.test(result);
-    const isServerErr = /5[0-9][0-9]/.test(result);
-    const isProviderErr = /provider returned error/i.test(result);
+    const isError = isErrorContent(result.content);
+    const isRateLimit = /rate limit|429|too many/i.test(result.content);
+    const isServerErr = /5[0-9][0-9]/.test(result.content);
+    const isProviderErr = /provider returned error/i.test(result.content);
 
     if (!isError) {
       // Success
       return result;
     }
 
-    lastError = result;
+    lastError = result.content;
 
     // Don't retry if user selected a specific model (not Auto)
     if (options.modelStore?.getSelectedModelId() !== AUTO_MODEL_ID) {
@@ -382,7 +582,7 @@ export async function askOpenRouterWithFallback(
     }
 
     // Don't retry for certain errors that won't be fixed by changing models
-    if (!isRateLimit && !isServerErr && !isProviderErr && !result.includes('model')) {
+    if (!isRateLimit && !isServerErr && !isProviderErr && !result.content.includes('model')) {
       break;
     }
 
@@ -394,7 +594,15 @@ export async function askOpenRouterWithFallback(
   }
 
   // All attempts failed, return the last error
-  return lastError ?? '**Error:** Unknown error occurred';
+  return { content: lastError ?? '**Error:** Unknown error occurred' };
+}
+
+/** @deprecated Use askOpenRouterToolAware; kept as a string-only wrapper. */
+export async function askOpenRouterWithFallback(
+  messages: ChatMessage[],
+  options: AskOpenRouterOptions
+): Promise<string> {
+  return (await askOpenRouterToolAware(messages, options)).content;
 }
 
 async function askOpenRouterInternal(
@@ -402,15 +610,13 @@ async function askOpenRouterInternal(
   options: AskOpenRouterOptions,
   useStream: boolean,
   apiKey: string
-): Promise<string> {
-  const body = buildRequestBody(
-    messages,
-    options.modelStore,
-    options.mode ?? 'ask',
-    options.hasVisionAttachments ?? false
-  );
+): Promise<ToolAwareResult> {
+  const body = buildRequestBody(messages, options);
   if (!('model' in body) && !('models' in body)) {
-    return '**Error:** No models configured. Open the model menu, turn on at least 3 models (teal switches), then Enable Auto — or pick a model by name.';
+    return {
+      content:
+        '**Error:** No models configured. Open the model menu, turn on at least 3 models (teal switches), then Enable Auto — or pick a model by name.',
+    };
   }
 
   try {
@@ -440,39 +646,44 @@ async function askOpenRouterInternal(
         /* body may not be JSON */
       }
       const modelId = typeof body.model === 'string' ? body.model : undefined;
-      return formatApiError(parsed, response.status, response.statusText, modelId);
+      return { content: formatApiError(parsed, response.status, response.statusText, modelId) };
     }
 
     if (useStream && contentType.includes('text/event-stream')) {
-      const streamed = await readSseStream(response, options.signal, options.onChunk!);
+      const streamed = await readSseStream(
+        response,
+        options.signal,
+        options.onChunk!,
+        options.onToolProgress
+      );
       if (options.signal?.aborted) {
         throw new AskOpenRouterAbortedError();
       }
-      if (streamed.length > 0) {
+      if (streamed.content.length > 0 || streamed.toolCalls?.length) {
         return streamed;
       }
-      return '**Error:** OpenRouter returned an empty response.';
+      return { content: '**Error:** OpenRouter returned an empty response.' };
     }
 
     if (useStream) {
-      const text = await readJsonCompletion(response);
-      if (text && !text.startsWith('**Error:**') && options.onChunk) {
-        options.onChunk(text, text);
+      const res = await readJsonCompletion(response);
+      if (res.content && !isErrorContent(res.content) && options.onChunk) {
+        options.onChunk(res.content, res.content);
       }
-      return text;
+      return res;
     }
 
-    const content = await readJsonCompletion(response);
+    const res = await readJsonCompletion(response);
     if (options.signal?.aborted) {
       throw new AskOpenRouterAbortedError();
     }
-    return content;
+    return res;
   } catch (err) {
     if (options.signal?.aborted || isAskOpenRouterAborted(err)) {
       throw new AskOpenRouterAbortedError();
     }
     const msg = err instanceof Error ? err.message : String(err);
-    return `**Network Error:** ${msg}`;
+    return { content: `**Network Error:** ${msg}` };
   }
 }
 
@@ -480,7 +691,5 @@ export async function askOpenRouter(
   messages: ChatMessage[],
   options: AskOpenRouterOptions
 ): Promise<string> {
-  // For now, just call the internal function directly
-  // The fallback version is available as askOpenRouterWithFallback
-  return askOpenRouterWithFallback(messages, options);
+  return (await askOpenRouterToolAware(messages, options)).content;
 }

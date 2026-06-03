@@ -1,8 +1,8 @@
 {
   "name": "openrouter-agent",
-  "displayName": "OpenRouter Agent",
-  "description": "Lightweight AI chat for VS Code and Cursor — Ask, Plan, and Agent modes powered by OpenRouter.",
-  "version": "1.20.10",
+  "displayName": "OpenRouter Agent — AI Coding Assistant",
+  "description": "Free AI coding assistant for VS Code — use Claude, GPT-4, Gemini & 300+ models. Ask, Plan, and Agent modes. No subscription required.",
+  "version": "1.22.10",
   "publisher": "ZihadHosan",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -18,20 +18,25 @@
     "vscode": "^1.85.0"
   },
   "categories": [
+    "Programming Languages",
     "Machine Learning",
-    "Other"
+    "AI",
+    "Chat"
   ],
   "keywords": [
-    "openrouter",
     "ai",
-    "chat",
+    "copilot",
+    "claude",
+    "chatgpt",
+    "gemini",
+    "openrouter",
     "agent",
+    "coding-assistant",
     "llm",
-    "assistant",
-    "copilot"
+    "free"
   ],
   "galleryBanner": {
-    "color": "#1e1e1e",
+    "color": "#0a1628",
     "theme": "dark"
   },
   "activationEvents": [
@@ -197,6 +202,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
+    "test:sanitize": "npm run compile && node scripts/test-tool-sanitize.mjs",
     "version:sync": "node scripts/bump-version-on-change.mjs",
     "package:vsix": "npm run compile && npx @vscode/vsce package --allow-missing-repository",
     "publish:marketplace": "npm run package:vsix && npx @vscode/vsce publish"

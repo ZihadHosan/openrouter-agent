@@ -12,7 +12,7 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 ### Added
 - **Composer busy border** — a teal gradient “snake” (~50% of the edge, blunt lead and soft tail) travels slowly on a 1px ring while a prompt runs; static border removed while busy; reduced-motion uses static border only.
 - **Composer balance badge** — shows OpenRouter credit balance (teal when positive, orange at $0) in the top-right of the message box when the API returns account or per-key limit data.
-- **Full OpenRouter model picker** — searchable catalog with **Free** / **Paid** tabs; scrollable menu (~280px). **Auto** mode uses on/off toggles (min 2 models); paid-model tip in the Auto banner.
+- **Full OpenRouter model picker** — searchable catalog with **Free** / **Paid** tabs; scrollable menu (~280px). **Auto** mode uses on/off toggles (min 3 models); paid-model tip in the Auto banner.
 - **Composer capability hint** — fixed message above the input when the selected model (or Auto pool) cannot read images/PDFs; hidden for vision-capable models.
 - **Catalog vision detection** — `architecture.input_modalities` from OpenRouter API (regex fallback).
 - **Model pricing in composer** — shows `$X/M input tokens | $Y/M output tokens` (teal numerals) when the panel is wide; collapses to teal **free** / **paid** when narrow (full line in tooltip).
@@ -28,6 +28,8 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 - System prompts clarify text `agent-tool` format, parallel read tools, and that workspace files are readable via tools.
 
 ### Fixed
+- **False “could not verify files” error** — broad project questions (database, CMS, integrations) auto-read `package.json`, `README.md`, and `list_files` when models only emit planning prose; Harmony channel tool scan (owl-alpha) and truncated ` ```agent` fences (Claude); clearer error when tools never ran (not “wrong folder”).
+- **Native tool-call token leaks** — dynamic Harmony/control-token sanitizer strips unknown `<|…|>` wire formats (Kimi, OpenRouter, future variants) from chat streams and final replies; Kimi `tool_call_begin` + `functions.*` blocks are parsed into extension tools when JSON is complete; `npm run test:sanitize` fixture regression.
 - **Assistant message UI** — empty `json` / `tool` code fences no longer render copy-only shells; streaming cursor no longer blinks after the reply finishes (stale render race).
 - **New chat model selection** — new sessions default to the first model (not Auto); Disable Auto works on new chats (no race overwriting the chosen model).
 - **Composer top row** — capability hint shrink-wraps to content; balance vertically centered on the same line; balance refetches after each completed prompt.

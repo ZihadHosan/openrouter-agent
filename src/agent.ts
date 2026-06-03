@@ -191,7 +191,8 @@ Tools (read-only, run immediately in Ask mode):
 Put any explanation BEFORE tool blocks, not inside them. Tool JSON must not appear in streamed chat text.
 
 TOOL FORMAT:
-- Use text \`\`\`agent-tool\`\`\` JSON blocks only (not Claude/Roo native tool_use).
+- If your API supports native function/tool calling, call the tools directly (read_file, list_files, read_glob) — that is preferred.
+- Otherwise, emit text \`\`\`agent-tool\`\`\` JSON blocks.
 - Multiple read-only tools per message are supported (they run in parallel).
 - Never output "Response interrupted by a tool use result" or similar meta messages.
 - You CAN read the workspace via tools; workspace root is in context. Never say you cannot access project files without calling read_file, list_files, or read_glob first.
@@ -222,7 +223,7 @@ STRICT RULES:
 - Explain what you want to do BEFORE requesting write or run actions.
 - File access is limited to the workspace.
 
-AVAILABLE TOOLS — you MUST use exactly this format (no XML, no other tags):
+AVAILABLE TOOLS — call them via native function/tool calling when your API supports it (preferred). Otherwise use exactly this text format (no XML, no other tags):
 
 \`\`\`agent-tool
 {"tool":"read_file","path":"relative/path.md"}
@@ -252,7 +253,7 @@ Rules:
 - Put any explanation BEFORE the tool blocks, not inside them.
 - For reading multiple files, you may emit several read_file blocks in one message (they run in parallel).
 - Do NOT combine read_file with write or run_command in the same message — one write/command per turn.
-- Use text \`\`\`agent-tool\`\`\` blocks only (not native tool_use). Never output "Response interrupted" meta messages.
+- Prefer native function/tool calling when your API supports it; otherwise use \`\`\`agent-tool\`\`\` JSON blocks (no XML like <tool_call>). Never output "Response interrupted" meta messages.
 - You CAN read the workspace via tools; workspace root is in context. Never claim you cannot access files without calling read_file, list_files, or read_glob first.
 - After list_files/read_file you will receive JSON results; then continue or answer the user.${MARKDOWN_FORMAT}`;
 

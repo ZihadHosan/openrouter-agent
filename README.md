@@ -1,9 +1,55 @@
-# OpenRouter Agent
+# OpenRouter Agent — Free AI Coding Assistant for VS Code
 
-AI chat for **VS Code** and **Cursor** — **Ask**, **Plan**, and **Agent** modes powered by [OpenRouter](https://openrouter.ai/). Use any OpenRouter model (free or paid). Chat opens in a **panel on the right**, beside your code.
+**Use Claude, GPT-4o, Gemini, DeepSeek, and 300+ AI models directly in VS Code — free.**  
+No subscription. No lock-in. Bring your own [OpenRouter API key](https://openrouter.ai/keys) (free tier available).
+
+The free AI coding assistant for VS Code and Cursor. Ask questions about your codebase, generate step-by-step plans, or let the **Agent** autonomously read files, write code, and run terminal commands — with your approval. Works with Claude, GPT-4o, Gemini, DeepSeek, and 300+ models via a single OpenRouter API key.
 
 [![VS Marketplace](https://img.shields.io/visual-studio-marketplace/v/ZihadHosan.openrouter-agent?label=VS%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=ZihadHosan.openrouter-agent)
+[![Installs](https://img.shields.io/visual-studio-marketplace/i/ZihadHosan.openrouter-agent)](https://marketplace.visualstudio.com/items?itemName=ZihadHosan.openrouter-agent)
+[![Rating](https://img.shields.io/visual-studio-marketplace/stars/ZihadHosan.openrouter-agent)](https://marketplace.visualstudio.com/items?itemName=ZihadHosan.openrouter-agent)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+---
+
+## Why OpenRouter Agent?
+
+Most AI coding assistants lock you into one provider, one model, and a monthly subscription. OpenRouter Agent is different:
+
+| | **OpenRouter Agent** | Subscription-based assistants | Single-provider tools |
+|---|---|---|---|
+| **50+ free models** | ✅ No billing required | ❌ Subscription required | ⚠️ Limited |
+| **300+ model catalog** | ✅ Claude, GPT-4, Gemini & more | ❌ Fixed model set | ❌ One provider |
+| **Auto model routing** | ✅ Smart per-message pick | ❌ | ❌ |
+| **No monthly fee** | ✅ Pay only for what you use | ❌ $10–40/mo | ⚠️ Varies |
+| **Approval-based Agent** | ✅ You approve every write & command | ⚠️ Varies | ⚠️ Varies |
+| **Works in Cursor IDE** | ✅ | ❌ | ⚠️ Varies |
+| **Image & PDF attachments** | ✅ | ⚠️ Varies | ❌ |
+| **Bring your own API key** | ✅ Full control | ❌ | ⚠️ Varies |
+
+---
+
+## Features
+
+🤖 **300+ AI models** — Claude 3.5 Sonnet, GPT-4o, Gemini 2.0 Flash, DeepSeek, Llama, Mistral, and more. Swap models per conversation without leaving VS Code.
+
+💸 **Free models included** — dozens of high-quality `:free` models (including `openrouter/owl-alpha`, `google/gemini-flash`, `meta-llama` and others) — no billing required.
+
+🧠 **Auto model routing** — enable **Auto** mode and the extension automatically picks the best model from your pool for each message, based on mode, message type, and vision needs.
+
+🔧 **Agent mode** — the AI reads your workspace files, proposes changes, and runs terminal commands. Every write and command requires your explicit approval. Destructive commands always prompt.
+
+📋 **Ask & Plan modes** — read-only workspace Q&A and step-by-step planning without touching files or running commands.
+
+📎 **Image, PDF & file attachments** — paste screenshots (Win+Shift+S → Ctrl+V), attach PDFs, images, or source files. Vision-capable models analyze them directly.
+
+🔗 **Clickable file mentions** — when the AI mentions a file that exists in your workspace (e.g. `agents.md`), it becomes a clickable link that opens the file in a real editor tab.
+
+📊 **Live activity log** — a compact, collapsible step-by-step progress panel shows exactly what the agent is doing, how long it's taken, and what files it's reading or writing — with per-type icons and a ticking elapsed timer.
+
+✅ **"Worked for X" summary** — when the agent finishes, a collapsible `✓ Worked for 1:45 · 25 steps` summary sits above the answer so you can audit the work.
+
+🔒 **Privacy-first** — API key stored in VS Code secure storage, never in settings. File access is workspace-scoped. No telemetry.
 
 ---
 
@@ -25,96 +71,101 @@ code --install-extension ZihadHosan.openrouter-agent
 
 ---
 
-## Get started
+## Quick Start
 
-### First-time setup (quick path)
+1. **Install** the extension and reload VS Code.
+2. **Set your API key** — `Ctrl+Shift+P` → **`OpenRouter: Set API Key`** → paste a key from [openrouter.ai/keys](https://openrouter.ai/keys). The free tier gives you access to 50+ free models immediately.
+3. **Open chat** — press **`Ctrl+Alt+L`** (Mac: `Cmd+Alt+L`), click **OpenRouter** in the status bar, or use the Command Palette.
+4. **Pick a mode and model** — choose **Ask**, **Plan**, or **Agent** and select any model from the in-chat catalog (or use **Auto** to let the extension pick).
 
-1. **Install** from Extensions → search **OpenRouter Agent** → **Install** → **Reload** if prompted.
-2. **Set API key** — **Ctrl+Shift+P** → **`OpenRouter: Set API Key`** → paste a key from [openrouter.ai/keys](https://openrouter.ai/keys).
-3. **Open chat** — click **OpenRouter** in the status bar, or press **Ctrl+Alt+L** (Mac: **Cmd+Alt+L**), or run **`OpenRouter: Open Chat`** from the Command Palette.
-4. **Send a message** — pick **Ask**, **Plan**, or **Agent**; attach **images, PDFs, or files** with the paperclip; use **Auto** or pick a model.
-
-### 1. Open a workspace
-
-Open a project folder (**File → Open Folder**). **Ask** and **Agent** modes need a workspace on disk to read files.
-
-### 2. Set your API key
-
-Your key is stored in the editor’s **secret storage** (not in plain settings).
-
-1. **Ctrl+Shift+P** (Mac: **Cmd+Shift+P**)
-2. Run **`OpenRouter: Set API Key`**
-3. Paste a key from [openrouter.ai/keys](https://openrouter.ai/keys)
-
-Remove it anytime: **`OpenRouter: Clear API Key`**.
-
-### 3. Open chat
-
-| Method | Action |
-|--------|--------|
-| **Status bar** | Click **OpenRouter** (bottom-right) |
-| **Shortcut** | **Ctrl+Alt+L** (Mac: **Cmd+Alt+L**) |
-| **Command Palette** | **`OpenRouter: Open Chat`** |
-| **Editor toolbar** | Chat icon on an open file |
-
-### 4. Send a message
-
-- **Enter** to send · **Shift+Enter** for a new line
-- **Paperclip**, **Ctrl+V / Cmd+V** (paste screenshots), or drag-and-drop to attach images, PDFs, or text/code files
-- Pick **Ask**, **Plan**, or **Agent** and a **model** below the input
-- While the model works, **↑** becomes **Stop (■)**
-
----
-
-## Features
-
-- **Ask** — Q&A and read-only file exploration in your workspace
-- **Plan** — Step-by-step plans without running tools
-- **Agent** — Read, write (with approval), and terminal commands (with approval)
-- **Streaming replies** — Token-by-token responses (disable in settings)
-- **Chat history** — Sessions saved automatically; switch or start new chats
-- **Any OpenRouter model** — Settings list + **Add model…** / **Remove model…** in chat (chat-added models are stored separately from Settings)
-- **Attachments** — Images, PDFs, and text/code files in chat. **Images and PDFs require a vision-capable model** (or **Auto** with at least one vision model in your list). Paste screenshots with Ctrl+V / Cmd+V. Text/PDF content is inlined for direct analysis; **Agent** can still use workspace tools for other paths in follow-ups.
-- **Smart scroll** — Follows new text unless you scroll up to read earlier content
+> 💡 **New to OpenRouter?** Create a free account at [openrouter.ai](https://openrouter.ai/), grab an API key, and use any `:free` model at zero cost.
 
 ---
 
 ## Modes
 
-### Ask
+### 🔍 Ask Mode
+Best for **explaining code, reading files, and quick answers**.
 
-Best for explaining code, reading files, and quick answers.
-
-- Reads and lists workspace files automatically
+- Reads and lists workspace files automatically via `list_files`, `read_file`, `read_glob`
 - Does not write files or run terminal commands
+- Great for: "explain this function", "find all API calls", "summarize this codebase"
 
-### Plan
+### 📋 Plan Mode
+Best for **designing before you code**.
 
-Best for designing before you code.
+- Produces ordered step-by-step plans with files to change and risks
+- No tools run — commands are listed for you to run manually
+- Great for: "plan a migration from REST to GraphQL", "how should I refactor this module"
 
-- Ordered steps, files to touch, risks, and commands **you** run manually
-- Does not edit files or call tools
-
-### Agent
-
-Best for multi-step work with your approval.
+### 🤖 Agent Mode
+Best for **multi-step autonomous work with your approval**.
 
 | Action | Behavior |
 |--------|----------|
 | Read / list files | Runs automatically |
-| Write files | Approval card in chat |
-| Terminal commands | Approval card; output in chat |
+| Write files | **Approval card in chat** — you confirm before anything is written |
+| Terminal commands | **Approval card** — output streams live in chat |
+| Destructive commands (`rm -rf`, etc.) | **Always prompts**, regardless of permission mode |
 
-Default permission level: **`OpenRouter: Agent Permissions`** (Command Palette).
+Default permission level: **`OpenRouter: Agent Permissions`** in the Command Palette.
 
-### Attachments
+---
 
-- **Text/code files** (`.md`, `.txt`, source files, etc.) and **PDFs** are sent inline in your message — the model should analyze them without listing the workspace first.
-- **Images** and **PDFs** require a **vision-capable** model (e.g. Gemini Flash, GPT-4o, Claude). **Auto** picks only from vision-capable models in your list when images/PDFs are attached.
-- **Paste screenshots** into the message box with **Ctrl+V** (Mac: **Cmd+V**) after Win+Shift+S, Print Screen, or any screenshot tool.
-- **Paperclip** and drag-and-drop also work for images, PDFs, and text files.
-- In **Agent** or **Ask**, you can still ask about *other* workspace files in the same or a follow-up message; tools run normally for those paths.
-- Text-only models (including many DeepSeek ids) cannot accept image input on OpenRouter — use **Auto** or add a vision model via **Add model…**.
+## Model Catalog & Auto Mode
+
+OpenRouter Agent gives you access to **300+ models** from a searchable in-chat catalog:
+
+- **Browse** — search by name, filter by **Free** or **Paid**
+- **Pick any model** for a single conversation
+- **Auto mode** — enable at least 3 models with the teal toggles, then **Enable Auto**. The extension scores and picks the best model for each message (vision-aware, mode-aware)
+- **Per-message pricing** shown in the composer footer so you always know the cost
+- **Balance badge** shows your OpenRouter credit balance in real time
+
+Popular free models available:
+- `openrouter/owl-alpha` (default)
+- `google/gemini-2.0-flash-lite:free`
+- `meta-llama/llama-3.3-70b-instruct:free`
+- `deepseek/deepseek-r1:free`
+- `mistralai/mistral-7b-instruct:free`
+
+---
+
+## Attachments
+
+Attach **images, PDFs, and text/code files** to any message:
+
+| How | What |
+|-----|------|
+| Paperclip button | Browse files (images, PDFs, source files) |
+| Drag and drop | Drop files into the composer |
+| Ctrl+V / Cmd+V | Paste screenshots directly from clipboard |
+
+- **Text/code files** and **PDFs** are sent inline — the model analyzes them directly
+- **Images and PDFs** require a vision-capable model (Claude, GPT-4o, Gemini) — or use **Auto** with a vision model in your pool
+- In Agent mode, you can ask about other workspace files in the same conversation alongside attachments
+
+---
+
+## Keyboard Shortcut
+
+| Action | Windows / Linux | macOS |
+|--------|----------------|-------|
+| Open chat | `Ctrl+Alt+L` | `Cmd+Alt+L` |
+
+---
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| **OpenRouter: Open Chat** | Open or focus chat panel |
+| **OpenRouter: Set API Key** | Save API key securely |
+| **OpenRouter: Clear API Key** | Remove stored API key |
+| **OpenRouter: Agent Permissions** | Set tool approval level |
+| **OpenRouter: Ask About Current File** | Open chat with the active file as context |
+| **OpenRouter: Explain Selection** | Explain selected code in Ask mode |
+| **OpenRouter: Fix Selection** | AI-suggest a fix, apply with one click |
 
 ---
 
@@ -124,48 +175,52 @@ Open **Settings** (`Ctrl+,`) and search **`openrouterAgent`**.
 
 | Setting | Purpose |
 |---------|---------|
-| **`openrouterAgent.agentPermissions`** | `ask` · `readOnly` · `workspace` · `full` |
-| **`openrouterAgent.shell`** | Custom shell for in-chat commands |
-| **`openrouterAgent.shellFallbacks`** | Extra shell paths if defaults fail |
-| **`openrouterAgent.chatFontSize`** | Chat text size in px (`0` = 14px) |
-| **`openrouterAgent.streamResponses`** | Stream replies token-by-token (default: on) |
-| **`openrouterAgent.showAccountBalance`** | Show OpenRouter balance in the chat composer (default: on) |
-| **`openrouterAgent.maxAttachments`** | Max files/images per message (default: 5) |
-| **`openrouterAgent.maxImageSizeMb`** | Max image size in MB (default: 4) |
-| **`openrouterAgent.maxPdfSizeMb`** | Max PDF size in MB (default: 10) |
-
-**Auto** picks one model per message from models you enable in the chat model menu (teal pool toggles), based on mode and what you wrote.
-
-### Managing models
-
-| Action | Where |
-|--------|--------|
-| **Pick a model for chat** | Model dropdown → tap a model name |
-| **Build Auto pool** | Model dropdown → turn on **teal switches** (at least 3), then **Enable Auto** |
-| **Disable Auto** | Model dropdown → **Disable Auto**, then pick a model by name |
-| **Browse catalog** | Model dropdown → search, **Free** / **Paid** filters |
+| `agentPermissions` | `ask` · `readOnly` · `workspace` · `full` |
+| `shell` | Custom shell for in-chat terminal commands |
+| `shellFallbacks` | Extra shell paths tried if defaults fail |
+| `chatFontSize` | Chat text size in px (`0` = 14px) |
+| `streamResponses` | Stream replies token-by-token (default: on) |
+| `contextGatherTimeoutMs` | Max ms to wait for editor/workspace context |
+| `debugPerformance` | Log `[perf]` timing to the Developer Console |
+| `showModelPricing` | Per-million token pricing in the composer |
+| `showAccountBalance` | OpenRouter balance badge in chat |
+| `maxAttachments` | Max attachments per message (default: 5) |
+| `maxImageSizeMb` | Max image size in MB (default: 4) |
+| `maxPdfSizeMb` | Max PDF size in MB (default: 10) |
 
 ---
 
-## Commands
+## Chat History
 
-| Command | Description |
-|---------|-------------|
-| **OpenRouter: Open Chat** | Open or focus chat |
-| **OpenRouter: Set API Key** | Save API key |
-| **OpenRouter: Clear API Key** | Remove API key |
-| **OpenRouter: Agent Permissions** | Default tool approval behavior |
-| **OpenRouter: Ask About Current File** | Ask mode with open file context |
-| **OpenRouter: Explain Selection** | Explain selected code |
-| **OpenRouter: Fix Selection** | Suggest a fix for selection |
+- Conversations **save automatically** across VS Code sessions
+- **History dropdown** — switch between sessions; each session remembers its model
+- **+** new chat — starts fresh on the default model
+- **Delete** session or **Clear** current chat at any time
 
 ---
 
-## Chat history
+## Frequently Asked Questions
 
-- Conversations **save automatically**
-- **History** dropdown — switch sessions
-- **+** new chat · **Del** delete session · **Clear** clear current chat only
+**Is OpenRouter Agent free?**  
+Yes. The extension itself is free and open-source (MIT). You can use it at zero cost with any of the 50+ free models on OpenRouter (models with the `:free` suffix). Paid models (Claude, GPT-4o, Gemini Pro, etc.) cost only what you actually use — there is no subscription or monthly fee.
+
+**Does it work in Cursor IDE?**  
+Yes. OpenRouter Agent works in both VS Code and Cursor. Install it from the VS Code Marketplace or the Cursor extension panel — setup is identical.
+
+**What AI models can I use?**  
+Any model available on [OpenRouter](https://openrouter.ai/models) — 300+ models including Claude 3.5 Sonnet, GPT-4o, Gemini 2.0 Flash, DeepSeek R1, Llama 3.3, Mistral, and many more. Free models are available immediately with a free OpenRouter account.
+
+**How is Auto mode different from picking a model manually?**  
+Auto mode scores every model in your pool for each individual message — taking into account the mode (Ask/Plan/Agent), message length, and whether you have image attachments — and routes to the best fit automatically. You build the pool; the extension decides per-message.
+
+**Is my code sent to the cloud?**  
+Only the content you explicitly include in your message is sent to OpenRouter (and forwarded to the chosen model provider). Your API key is stored in VS Code's secure secret storage and never appears in settings or logs. File access is limited to your open workspace folder. There is no telemetry.
+
+**Can it write and run code autonomously?**  
+In **Agent mode**, yes — but with mandatory approval gates. Every file write and every terminal command shows an approval card in chat that you must confirm before anything happens. Destructive commands (like `rm -rf`) always prompt regardless of your permission settings. You are always in control.
+
+**What is the difference between Ask, Plan, and Agent mode?**  
+**Ask** reads your workspace and answers questions (read-only). **Plan** produces step-by-step written plans without touching any files. **Agent** can read, write, and run commands with your approval.
 
 ---
 
@@ -173,35 +228,42 @@ Open **Settings** (`Ctrl+,`) and search **`openrouterAgent`**.
 
 | Problem | Fix |
 |---------|-----|
-| Chat doesn’t open | Reload window; confirm extension is **Enabled** |
-| **Ctrl+Alt+L** does nothing | Command Palette → **OpenRouter: Open Chat** |
-| “No API key” | **OpenRouter: Set API Key** |
-| **Insufficient credits** on a paid model | Add credits at [openrouter.ai/settings/credits](https://openrouter.ai/settings/credits), or pick a **free** model (`:free` suffix or **Free** filter in the model menu) |
-| Balance badge missing | OpenRouter may not expose balance for your key type; add credits at [openrouter.ai/settings/credits](https://openrouter.ai/settings/credits) or set a per-key credit limit on [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) |
-| Agent can’t run commands | Open a workspace folder; set **`openrouterAgent.shell`** if needed |
-| Wrong files in Ask mode | Open the correct folder; start a **new chat** |
-| Extension feels outdated | Extensions → check for updates, or reload window |
+| Chat doesn't open | Reload window; confirm extension is **Enabled** |
+| `Ctrl+Alt+L` does nothing | Command Palette → **OpenRouter: Open Chat** |
+| "No API key" error | **OpenRouter: Set API Key** from Command Palette |
+| API key not working / "Invalid API key" | Double-check the key at [openrouter.ai/keys](https://openrouter.ai/keys). Run **Clear API Key** then **Set API Key** to re-enter it. Keys start with `sk-or-`. |
+| **Insufficient credits** on a paid model | Add credits at [openrouter.ai/settings/credits](https://openrouter.ai/settings/credits), or pick a **free** model (`:free` suffix) |
+| Balance badge missing | OpenRouter may not expose balance for your key type; set a per-key limit at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) |
+| Models not loading in the picker | The catalog refreshes from OpenRouter on open. Check your internet connection; re-open the model menu after reconnecting. |
+| **Provider returned error** | Switch model or use **Auto**; check [OpenRouter status](https://openrouter.ai/) |
+| **Auto** won't enable | Enable at least **3** models with the teal toggles in the model menu |
+| Agent can't run commands | Open a workspace folder; set `openrouterAgent.shell` if needed |
+| Agent seems stuck / no progress | Click **Stop ■**; if the extension host crashed, reload the window (`Ctrl+Shift+P` → **Reload Window**). |
+| Long wait after answer appears | This is the model finishing hidden reasoning — the UI shows "Finishing up…" and resolves automatically |
+| Extension not activating on startup | Requires VS Code ≥1.85. Run **Check for Updates** or reinstall the extension. |
 
 ---
 
-## Privacy & safety
+## Privacy & Security
 
-- API keys stay in **VS Code secret storage**
-- File access is limited to the **open workspace**
-- Writes and commands require approval (unless you change permissions)
-- Destructive commands show an extra warning
+- **API key**: stored in VS Code **secret storage** — never in `settings.json` or logs
+- **File access**: strictly scoped to your open workspace folder
+- **Writes and commands**: require explicit user approval in Agent mode
+- **Destructive commands**: always prompt, regardless of permission settings
+- **External links**: VS Code confirm dialog before any browser opens
+- **No telemetry**: zero analytics or tracking
 
-Full disclosure: **[PRIVACY.md](./PRIVACY.md)** — what is sent to OpenRouter and what stays local.
+Full disclosure: **[PRIVACY.md](./PRIVACY.md)**
 
 ---
 
 ## Development
 
-Building from source, F5 debug, and full contributor guide:
+Building from source, F5 debug, contributor guide:
 
 **[docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)**
 
-**Release checklist** (local VSIX + Marketplace publish — use this when shipping a new version):
+Release checklist (VSIX + Marketplace publish):
 
 **[docs/RELEASE.md](./docs/RELEASE.md)**
 

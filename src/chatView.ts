@@ -20,7 +20,14 @@ import type { ChatSessionMessage, ToolDetailEntry } from './chatHistory';
 import { AUTO_MODEL_ID, ModelStore } from './models';
 
 export type { ChatSessionMessage, ToolDetailEntry };
-import { askOpenRouter, AskOpenRouterAbortedError, ChatMessage } from './openrouter';
+import {
+  askOpenRouterToolAware,
+  AskOpenRouterAbortedError,
+  ChatMessage,
+  NativeToolCall,
+  OpenRouterToolDef,
+  ToolAwareResult,
+} from './openrouter';
 import {
   getAccountBalanceForWebview,
   getOpenRouterBalanceCache,
@@ -36,11 +43,15 @@ import {
   describeToolCall,
   buildAutoToolCall,
   buildAutoToolCalls,
+  buildVerificationFallbackTools,
   canParallelizeReadTools,
   detectUserFileIntent,
   executeReadToolsInParallel,
   FILE_ACCESS_REFUSAL_RETRY_PROMPT,
+  getToolDefsForMode,
   handleToolCall,
+  parseNativeToolCall,
+  type ToolHandlerContext,
   hasToolCallMarkup,
   hasToolInterruptionArtifact,
   isReadOnlyTool,
@@ -49,11 +60,14 @@ import {
   parseAllToolCalls,
   parseToolCall,
   requiresFileVerification,
+  resolveExistingWorkspaceFile,
   resolveToolCall,
   shouldSuppressVisibleAsFinal,
   stripToolBlock,
   sanitizeModelOutput,
   TOOL_INTERRUPTION_RETRY_PROMPT,
+  TOOL_PARSE_FAILED_MESSAGE,
+  VERIFICATION_TOOLS_FAILED_MESSAGE,
   clearToolResultCache,
   type ToolCall,
 } from './tools';
@@ -82,6 +96,8 @@ export class ChatViewProvider {
   private streamActiveForUi = false;
   private hasVisionInRequest = false;
   private stripToolLeaksInStream = false;
+  /** Native tool schemas advertised for the in-flight request (empty in plan mode). */
+  private currentToolDefs: OpenRouterToolDef[] = [];
   private balanceRefreshTimer?: ReturnType<typeof setInterval>;
   private readonly approvalBridge: ApprovalBridge;
 
@@ -248,8 +264,16 @@ export class ChatViewProvider {
     url?: string;
     files?: { name: string; mimeType: string; base64: string }[];
     attachmentIds?: string[];
+    path?: string;
+    paths?: string[];
   }): Promise<void> {
     switch (msg.type) {
+      case 'openFile':
+        await this.openWorkspaceFile(String(msg.path ?? ''));
+        break;
+      case 'resolveFiles':
+        await this.resolveFileMentions(Array.isArray(msg.paths) ? msg.paths : []);
+        break;
       case 'openLink': {
         const url = String(msg.url ?? '').trim();
         if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -405,6 +429,46 @@ export class ChatViewProvider {
       this.pendingUserMessage = text;
       await this.focus();
     }
+  }
+
+  /** Open an existing workspace file in a regular editor tab (beside the chat). */
+  private async openWorkspaceFile(filePath: string): Promise<void> {
+    const resolved = await resolveExistingWorkspaceFile(filePath);
+    if (!resolved) {
+      void vscode.window.showInformationMessage(
+        `OpenRouter Agent: "${filePath}" was not found in the workspace.`
+      );
+      return;
+    }
+    try {
+      const doc = await vscode.workspace.openTextDocument(resolved.uri);
+      await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.One,
+        preview: false,
+        preserveFocus: false,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`OpenRouter Agent: Could not open file. ${detail}`);
+    }
+  }
+
+  /** Validate candidate file mentions; reply with the subset that really exists. */
+  private async resolveFileMentions(candidates: string[]): Promise<void> {
+    const seen = new Set<string>();
+    const existing: { input: string; path: string }[] = [];
+    for (const raw of candidates.slice(0, 80)) {
+      const input = String(raw ?? '').trim();
+      if (!input || seen.has(input)) {
+        continue;
+      }
+      seen.add(input);
+      const resolved = await resolveExistingWorkspaceFile(input);
+      if (resolved) {
+        existing.push({ input, path: resolved.relative });
+      }
+    }
+    this.post({ type: 'filesResolved', files: existing });
   }
 
   private postAttachmentsUpdated(): void {
@@ -613,6 +677,8 @@ export class ChatViewProvider {
     mode: AgentMode;
     hasVisionAttachments?: boolean;
     signal?: AbortSignal;
+    tools?: OpenRouterToolDef[];
+    supportsTools?: (modelId: string) => boolean;
   } {
     return {
       modelStore: this.modelStore,
@@ -620,6 +686,8 @@ export class ChatViewProvider {
       mode: this.mode,
       hasVisionAttachments: this.hasVisionInRequest,
       signal: this.activeAbortController?.signal,
+      tools: this.currentToolDefs.length > 0 ? this.currentToolDefs : undefined,
+      supportsTools: (id) => this.getPricingCache().supportsTools(id),
     };
   }
 
@@ -639,8 +707,11 @@ export class ChatViewProvider {
     stopAllRunningProcesses();
   }
 
-  private async callOpenRouter(conversation: ChatMessage[]): Promise<string> {
-    return sanitizeModelOutput(await askOpenRouter(conversation, this.routerOptions()));
+  private async callOpenRouterToolAware(
+    conversation: ChatMessage[]
+  ): Promise<ToolAwareResult> {
+    const res = await askOpenRouterToolAware(conversation, this.routerOptions());
+    return { content: sanitizeModelOutput(res.content), toolCalls: res.toolCalls };
   }
 
   private cancelStreamUi(): void {
@@ -653,9 +724,9 @@ export class ChatViewProvider {
   private async callOpenRouterStreaming(
     conversation: ChatMessage[],
     forwardToUi: boolean
-  ): Promise<string> {
+  ): Promise<ToolAwareResult> {
     if (!this.getStreamEnabled() || !forwardToUi) {
-      return this.callOpenRouter(conversation);
+      return this.callOpenRouterToolAware(conversation);
     }
 
     let streamStarted = false;
@@ -699,8 +770,9 @@ export class ChatViewProvider {
 
     const apiSpan = new PerfSpan('apiRequest');
     let firstTokenLogged = false;
+    let lastToolProgressAt = 0;
 
-    const result = await askOpenRouter(conversation, {
+    const result = await askOpenRouterToolAware(conversation, {
       ...this.routerOptions(),
       stream: true,
       onChunk: (_delta, accumulated) => {
@@ -714,6 +786,16 @@ export class ChatViewProvider {
           apiSpan.end('→ first token');
         }
         schedulePartial(content);
+      },
+      onToolProgress: (info) => {
+        // Surfaces silent native tool-call generation (e.g. a large file write)
+        // so the user always sees motion. Throttled to avoid message spam.
+        const now = Date.now();
+        if (now - lastToolProgressAt < STREAM_POST_THROTTLE_MS) {
+          return;
+        }
+        lastToolProgressAt = now;
+        this.post({ type: 'toolProgress', name: info.name, bytes: info.bytes });
       },
     });
 
@@ -729,14 +811,14 @@ export class ChatViewProvider {
       this.streamActiveForUi = false;
     }
 
-    let finalText = sanitizeModelOutput(result);
+    let finalText = sanitizeModelOutput(result.content);
     if (this.stripToolLeaksInStream) {
       finalText = stripToolBlock(finalText);
     }
     if (!firstTokenLogged) {
       apiSpan.end('→ complete (no stream chunks)');
     }
-    return finalText;
+    return { content: finalText, toolCalls: result.toolCalls };
   }
 
   private setLoading(
@@ -867,6 +949,8 @@ export class ChatViewProvider {
     this.processing = true;
     this.mode = mode;
     this.hasVisionInRequest = hasVisionAttachments(committed);
+    // Advertise native tool schemas (read tools in Ask, +write/run in Agent, none in Plan).
+    this.currentToolDefs = getToolDefsForMode(mode, mode === 'agent');
     // Strip tool markup from streamed tokens in Ask/Agent (models like owl-alpha emit many blocks)
     this.stripToolLeaksInStream =
       committed.length > 0 || mode === 'ask' || mode === 'agent';
@@ -955,7 +1039,7 @@ export class ChatViewProvider {
           'Step 1: Planning…',
           'Reviewing your request and drafting a plan…'
         );
-        response = await this.callOpenRouterStreaming(conversation, true);
+        response = (await this.callOpenRouterStreaming(conversation, true)).content;
         if (this.isAborted()) {
           this.cancelStreamUi();
           response = STOPPED_MESSAGE;
@@ -1029,6 +1113,7 @@ export class ChatViewProvider {
       this.processing = false;
       this.hasVisionInRequest = false;
       this.stripToolLeaksInStream = false;
+      this.currentToolDefs = [];
       this.activeAbortController = undefined;
       this.streamActiveForUi = false;
       this.setLoading(false);
@@ -1077,10 +1162,74 @@ export class ChatViewProvider {
     let toolsRun = 0;
     let parseRetries = 0;
     let unverifiedRetries = 0;
+    let verificationFallbackAttempted = false;
     const needsVerification = requiresFileVerification(userText, { hasAttachments });
 
-    const autoCalls = hasAttachments ? [] : buildAutoToolCalls(detectUserFileIntent(userText));
+    const runVerificationFallbackBatch = async (
+      assistantRaw: string,
+      statusLabel: string
+    ): Promise<boolean> => {
+      if (
+        verificationFallbackAttempted ||
+        hasAttachments ||
+        !needsVerification ||
+        this.isAborted()
+      ) {
+        return false;
+      }
+      const fallback = buildVerificationFallbackTools(userText);
+      if (fallback.length === 0) {
+        return false;
+      }
+      verificationFallbackAttempted = true;
+      if (fallback.length >= 2 && canParallelizeReadTools(fallback)) {
+        const resolvedBatch = fallback.map((c) => resolveToolCall(c));
+        stepNum++;
+        const batchStep = `Step ${stepNum}: ${statusLabel} (${resolvedBatch.length} files)…`;
+        this.updateProcess(completedSteps, batchStep, 'Reading workspace files…');
+        const ran = await this.runReadToolsInParallel(
+          resolvedBatch,
+          assistantRaw,
+          conversation,
+          details,
+          completedSteps,
+          stepNum
+        );
+        if (ran) {
+          toolsRun += resolvedBatch.length;
+        }
+        return ran;
+      }
+      const resolved = resolveToolCall(fallback[0]);
+      stepNum++;
+      const toolStep = describeProcessStep(stepNum, 'tool', resolved);
+      this.updateProcess(completedSteps, toolStep);
+      const ran = await this.runOneTool(
+        resolved,
+        assistantRaw,
+        conversation,
+        details,
+        completedSteps,
+        stepNum,
+        allowWrites,
+        this.activeAbortController?.signal
+      );
+      if (ran) {
+        toolsRun++;
+      }
+      return ran;
+    };
+
+    let autoCalls = hasAttachments ? [] : buildAutoToolCalls(detectUserFileIntent(userText));
+    let autoCallsFromVerificationFallback = false;
+    if (!hasAttachments && autoCalls.length === 0 && needsVerification) {
+      autoCalls = buildVerificationFallbackTools(userText);
+      autoCallsFromVerificationFallback = autoCalls.length > 0;
+    }
     if (autoCalls.length >= 2 && canParallelizeReadTools(autoCalls) && !this.isAborted()) {
+      if (autoCallsFromVerificationFallback) {
+        verificationFallbackAttempted = true;
+      }
       const resolvedBatch = autoCalls.map((c) => resolveToolCall(c));
       stepNum++;
       const batchStep = `Step ${stepNum}: Reading ${resolvedBatch.length} project files…`;
@@ -1097,6 +1246,9 @@ export class ChatViewProvider {
         toolsRun += resolvedBatch.length;
       }
     } else if (autoCalls.length === 1 && !this.isAborted()) {
+      if (autoCallsFromVerificationFallback) {
+        verificationFallbackAttempted = true;
+      }
       const resolved = resolveToolCall(autoCalls[0]);
       stepNum++;
       const toolStep = describeProcessStep(stepNum, 'tool', resolved);
@@ -1127,9 +1279,9 @@ export class ChatViewProvider {
         : describeProcessStep(stepNum, 'thinking');
       this.updateProcess(completedSteps, thinkStep);
 
-      let raw: string;
+      let res: ToolAwareResult;
       try {
-        raw = await this.callOpenRouterStreaming(conversation, true);
+        res = await this.callOpenRouterStreaming(conversation, true);
       } catch (err) {
         if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
           this.cancelStreamUi();
@@ -1137,6 +1289,7 @@ export class ChatViewProvider {
         }
         throw err;
       }
+      const raw = res.content;
       lastAssistant = raw;
 
       if (this.isAborted()) {
@@ -1151,6 +1304,33 @@ export class ChatViewProvider {
       ) {
         this.cancelStreamUi();
         return { content: raw, details };
+      }
+
+      // Native tool calls (Claude/GPT/Gemini) take priority over text agent-tool blocks.
+      const nativeToolCalls = res.toolCalls ?? [];
+      if (nativeToolCalls.length > 0) {
+        this.cancelStreamUi();
+        const visibleNative = cleanAssistantVisibleText(raw);
+        if (visibleNative) {
+          this.updateProcess(completedSteps, thinkStep.replace(/…$/, '') + '…', visibleNative);
+        }
+        completedSteps.push(thinkStep.replace(/…$/, '') + ' — done');
+        const { ran, nextStep } = await this.runNativeToolCalls(
+          nativeToolCalls,
+          raw,
+          conversation,
+          details,
+          completedSteps,
+          stepNum,
+          allowWrites,
+          this.activeAbortController?.signal
+        );
+        stepNum = nextStep;
+        toolsRun += ran;
+        if (this.isAborted()) {
+          return { content: STOPPED_MESSAGE, details };
+        }
+        continue;
       }
 
       const toolCalls = parseAllToolCalls(raw);
@@ -1194,7 +1374,7 @@ export class ChatViewProvider {
         ) {
           unverifiedRetries++;
           completedSteps.push(thinkStep.replace(/…$/, '') + ' — retrying after file-access refusal…');
-          const refusalAuto = buildAutoToolCalls(detectUserFileIntent(userText));
+          const refusalAuto = buildVerificationFallbackTools(userText);
           if (refusalAuto.length >= 2 && canParallelizeReadTools(refusalAuto)) {
             const resolvedBatch = refusalAuto.map((c) => resolveToolCall(c));
             stepNum++;
@@ -1245,6 +1425,10 @@ export class ChatViewProvider {
         if (guessedAboutFiles && unverifiedRetries < MAX_UNVERIFIED_RETRIES) {
           unverifiedRetries++;
           completedSteps.push(thinkStep.replace(/…$/, '') + ' — verifying files…');
+          const ranFallback = await runVerificationFallbackBatch(raw, 'Verifying workspace');
+          if (ranFallback) {
+            continue;
+          }
           const fallbackAuto = buildAutoToolCall(detectUserFileIntent(userText));
           if (fallbackAuto) {
             const resolved = resolveToolCall(fallbackAuto);
@@ -1275,6 +1459,13 @@ export class ChatViewProvider {
           continue;
         }
 
+        if (needsVerification && toolsRun === 0) {
+          const ranLastChance = await runVerificationFallbackBatch(raw, 'Auto-reading project');
+          if (ranLastChance) {
+            continue;
+          }
+        }
+
         completedSteps.push(
           thinkStep.replace(/…$/, '').replace(/\.+$/, '') + ' — done'
         );
@@ -1289,13 +1480,12 @@ export class ChatViewProvider {
         ) {
           displayParts.push(visible);
         } else if (needsVerification && toolsRun === 0) {
-          displayParts.push(
-            '_Could not verify files in the workspace. Try again, open the correct folder, or switch models._'
-          );
+          if (displayParts.length > 0) {
+            displayParts.length = 0;
+          }
+          displayParts.push(VERIFICATION_TOOLS_FAILED_MESSAGE);
         } else if (hasToolCallMarkup(raw)) {
-          displayParts.push(
-            '_Could not run a tool call from the model. Try again or switch models._'
-          );
+          displayParts.push(TOOL_PARSE_FAILED_MESSAGE);
         }
         break;
       }
@@ -1420,7 +1610,7 @@ export class ChatViewProvider {
     return {
       content:
         needsVerification && toolsRun === 0
-          ? '_Could not verify files in the workspace. Open the correct folder and try again._'
+          ? VERIFICATION_TOOLS_FAILED_MESSAGE
           : '_No response from the model. Check your API key and model, then try again._',
       details,
     };
@@ -1481,68 +1671,11 @@ export class ChatViewProvider {
       return false;
     }
 
-    // Track terminal process for cancellation
-    let processRunId: string | undefined;
-    if (toolCall.tool === 'run_command' && toolCall.command) {
-      processRunId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    }
-
-    const { result, displayNote } = await handleToolCall(toolCall, {
-      onPropose: () => {
-        /* approval card shown in chat */
-      },
-      requestApproval: (req) => this.approvalBridge.request(req),
-      terminalCallbacks: {
-        onStart: (info) => {
-          // Track the running process
-          if (processRunId) {
-            // We'll track by runId in the map - but we need to get the actual process
-            // For now, we'll use the runId to correlate
-          }
-          this.post({
-            type: 'terminalRunStart',
-            runId: info.runId,
-            command: info.command,
-            cwd: info.cwd,
-            shell: info.shell,
-            background: info.background,
-          });
-        },
-        onOutput: (info) => {
-          this.post({
-            type: 'terminalRunUpdate',
-            runId: info.runId,
-            stdout: info.stdout,
-            stderr: info.stderr,
-          });
-        },
-        onComplete: (run) => {
-          this.post({
-            type: 'terminalRunEnd',
-            runId: run.runId,
-            command: run.command,
-            cwd: run.cwd,
-            shell: run.shell,
-            stdout: run.stdout,
-            stderr: run.stderr,
-            exitCode: run.exitCode,
-            timedOut: run.timedOut,
-            success: run.success,
-            background: run.background,
-            running: run.running,
-          });
-          // Stop tracking process if it's not background
-          if (!run.running && !run.background && processRunId) {
-            // The runId in run.runId should match our processRunId
-            // We track it in chatView's map for cancellation
-            // This will be handled by the runCommandInWorkspace signal handling
-          }
-        },
-      },
-      onTerminalOutput: () => {
-        /* terminal UI driven by terminalCallbacks */
-      },
-    }, signal);
+    const { result, displayNote } = await handleToolCall(
+      toolCall,
+      this.buildToolCtx(),
+      signal
+    );
 
     const resultPreview =
       result.length > 6000 ? result.slice(0, 6000) + '\n… [truncated]' : result;
@@ -1581,6 +1714,135 @@ export class ChatViewProvider {
     return true;
   }
 
+  /** Tool-handler context: in-chat approvals + terminal output forwarded to the webview. */
+  private buildToolCtx(): ToolHandlerContext {
+    return {
+      onPropose: () => {
+        /* approval card shown in chat */
+      },
+      requestApproval: (req) => this.approvalBridge.request(req),
+      terminalCallbacks: {
+        onStart: (info) => {
+          this.post({
+            type: 'terminalRunStart',
+            runId: info.runId,
+            command: info.command,
+            cwd: info.cwd,
+            shell: info.shell,
+            background: info.background,
+          });
+        },
+        onOutput: (info) => {
+          this.post({
+            type: 'terminalRunUpdate',
+            runId: info.runId,
+            stdout: info.stdout,
+            stderr: info.stderr,
+          });
+        },
+        onComplete: (run) => {
+          this.post({
+            type: 'terminalRunEnd',
+            runId: run.runId,
+            command: run.command,
+            cwd: run.cwd,
+            shell: run.shell,
+            stdout: run.stdout,
+            stderr: run.stderr,
+            exitCode: run.exitCode,
+            timedOut: run.timedOut,
+            success: run.success,
+            background: run.background,
+            running: run.running,
+          });
+        },
+      },
+      onTerminalOutput: () => {
+        /* terminal UI driven by terminalCallbacks */
+      },
+    };
+  }
+
+  /**
+   * Execute native (OpenRouter/OpenAI) tool calls and append the required
+   * assistant `tool_calls` turn + one `role:'tool'` result per call.
+   * Every tool_call_id MUST be answered, so unparseable/blocked calls get an error result.
+   */
+  private async runNativeToolCalls(
+    nativeCalls: NativeToolCall[],
+    assistantContent: string,
+    conversation: ChatMessage[],
+    details: ToolDetailEntry[],
+    completedSteps: string[],
+    startStep: number,
+    allowWrites: boolean,
+    signal?: AbortSignal
+  ): Promise<{ ran: number; nextStep: number }> {
+    const visible = cleanAssistantVisibleText(assistantContent);
+    conversation.push({
+      role: 'assistant',
+      content: visible || null,
+      tool_calls: nativeCalls.map((tc) => ({
+        id: tc.id,
+        type: 'function' as const,
+        function: tc.function,
+      })),
+    });
+
+    let ran = 0;
+    let step = startStep;
+
+    for (const native of nativeCalls) {
+      if (this.isAborted()) {
+        break;
+      }
+      const parsed = parseNativeToolCall(native);
+      step++;
+
+      if (!parsed || (!allowWrites && !isReadOnlyTool(parsed.tool))) {
+        const message = !parsed
+          ? `Unsupported or unparseable tool: ${native.function?.name ?? 'unknown'}`
+          : `${parsed.tool} is not allowed in this mode. Switch to Agent mode for writes and commands.`;
+        conversation.push({
+          role: 'tool',
+          tool_call_id: native.id,
+          content: JSON.stringify({ error: message }),
+        });
+        completedSteps.push(
+          `Step ${step}: ${parsed ? `Skipped ${parsed.tool}` : 'Unsupported tool'}`
+        );
+        continue;
+      }
+
+      const toolStep = describeProcessStep(step, 'tool', parsed);
+      this.updateProcess(completedSteps, toolStep);
+
+      const { result, displayNote } = await handleToolCall(
+        parsed,
+        this.buildToolCtx(),
+        signal
+      );
+
+      const resultPreview =
+        result.length > 6000 ? result.slice(0, 6000) + '\n… [truncated]' : result;
+      details.push({
+        step,
+        title: displayNote ?? describeToolCall(parsed),
+        result: resultPreview,
+      });
+      completedSteps.push(describeProcessDone(step, parsed, displayNote));
+
+      conversation.push({
+        role: 'tool',
+        tool_call_id: native.id,
+        content: result,
+      });
+      ran++;
+    }
+
+    return { ran, nextStep: step };
+  }
+
   private async fetchFinalSummary(
     conversation: ChatMessage[],
     completedSteps: string[],
@@ -1606,7 +1868,7 @@ export class ChatViewProvider {
 
     let raw: string;
     try {
-      raw = await this.callOpenRouterStreaming(conversation, true);
+      raw = (await this.callOpenRouterStreaming(conversation, true)).content;
     } catch (err) {
       if (err instanceof AskOpenRouterAbortedError || this.isAborted()) {
         this.cancelStreamUi();
@@ -2278,6 +2540,28 @@ export class ChatViewProvider {
     @keyframes cursorBlink {
       50% { opacity: 0; }
     }
+    /* Inline "still working" chip shown at the end of a streamed message while the
+       model is busy but not producing visible text (reading files, finishing up). */
+    .stream-working {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 6px;
+      font-size: 0.86em;
+      color: var(--vscode-charts-teal, #4ec9b0);
+      vertical-align: baseline;
+    }
+    .stream-working .thinking-dots span {
+      width: 5px;
+      height: 5px;
+      background: var(--vscode-charts-teal, #4ec9b0);
+    }
+    .stream-working-label {
+      color: var(--vscode-descriptionForeground);
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .stream-working .thinking-dots span { animation: none; opacity: 0.7; }
+    }
     @media (prefers-reduced-motion: reduce) {
       .msg.assistant.msg-enter,
       .msg.thinking {
@@ -2298,14 +2582,14 @@ export class ChatViewProvider {
       }
     }
     .msg.thinking {
-      color: var(--vscode-descriptionForeground);
-      background: transparent;
-      border: 1px dashed var(--vscode-panel-border);
-      border-radius: 8px;
+      color: var(--vscode-foreground);
+      background: var(--vscode-editorWidget-background, rgba(127,127,127,0.06));
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 10px;
       align-self: stretch;
       width: 100%;
       max-width: 100%;
-      padding: 10px 14px;
+      padding: 10px 12px;
       opacity: 1;
       animation: thinkingIn 0.2s ease;
     }
@@ -2444,6 +2728,107 @@ export class ChatViewProvider {
       0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
       40% { transform: scale(1); opacity: 1; }
     }
+    /* --- Modern agent activity log --- */
+    .activity-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9em;
+      min-width: 0;
+    }
+    .activity-cur-icon {
+      display: inline-flex;
+      flex-shrink: 0;
+      color: var(--vscode-descriptionForeground);
+    }
+    .activity-cur-label {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .activity-elapsed {
+      margin-left: auto;
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+      font-size: 0.82em;
+      opacity: 0.7;
+      color: var(--vscode-descriptionForeground);
+    }
+    .step-icon {
+      width: 14px;
+      height: 14px;
+      flex-shrink: 0;
+      vertical-align: middle;
+    }
+    .step-icon-check { color: var(--vscode-testing-iconPassed, #89d185); }
+    .step-path {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.92em;
+      background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.14));
+      padding: 0 4px;
+      border-radius: 4px;
+    }
+    .activity-collapse { margin-top: 8px; }
+    .activity-toggle, .activity-summary > summary {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      list-style: none;
+      font-size: 0.82em;
+      color: var(--vscode-descriptionForeground);
+      user-select: none;
+    }
+    .activity-toggle::-webkit-details-marker,
+    .activity-summary > summary::-webkit-details-marker { display: none; }
+    .activity-toggle:hover, .activity-summary > summary:hover {
+      color: var(--vscode-foreground);
+    }
+    .activity-chevron {
+      width: 0;
+      height: 0;
+      border-left: 4px solid transparent;
+      border-right: 4px solid transparent;
+      border-top: 5px solid currentColor;
+      transition: transform 0.15s ease;
+    }
+    .activity-collapse[open] > .activity-toggle .activity-chevron,
+    .activity-summary[open] > summary .activity-chevron { transform: rotate(180deg); }
+    .activity-steps {
+      list-style: none;
+      margin: 6px 0 0;
+      padding: 0;
+      max-height: 168px;
+      overflow-y: auto;
+      -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 10px, #000 calc(100% - 6px), transparent 100%);
+      mask-image: linear-gradient(to bottom, transparent 0, #000 10px, #000 calc(100% - 6px), transparent 100%);
+    }
+    .activity-step {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 2.5px 2px;
+      font-size: 0.85em;
+      line-height: 1.35;
+      color: var(--vscode-descriptionForeground);
+    }
+    .activity-step .step-icon { opacity: 0.85; }
+    .activity-step-text {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .activity-step-count { opacity: 0.6; font-size: 0.9em; }
+    .activity-summary {
+      margin: 0 0 10px;
+    }
+    .activity-summary[open] > summary { margin-bottom: 6px; }
+    @media (prefers-reduced-motion: reduce) {
+      .activity-chevron { transition: none; }
+    }
     .msg-body :not(pre) > code {
       font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
       font-size: 0.88em;
@@ -2453,6 +2838,41 @@ export class ChatViewProvider {
       padding: 0.08em 0.35em;
       border-radius: 4px;
       letter-spacing: normal;
+    }
+    .msg-body a[data-href] {
+      color: var(--vscode-textLink-foreground);
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .msg-body a[data-href]:hover { text-decoration: underline; }
+    /* Inline code that is a verified, openable workspace file — plain teal link, no box */
+    code.file-link {
+      cursor: pointer;
+      color: var(--vscode-charts-teal, #4ec9b0);
+      background: transparent;
+      border: none;
+      padding: 0;
+      border-radius: 0;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+      transition: color 0.12s ease;
+    }
+    code.file-link:hover {
+      color: var(--vscode-charts-teal, #4ec9b0);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    code.file-link:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 2px;
+      border-radius: 3px;
+    }
+    code.file-link .step-icon {
+      width: 0.9em;
+      height: 0.9em;
+      margin-right: 3px;
+      vertical-align: -0.13em;
+      opacity: 0.9;
     }
     .msg.assistant .msg-body .code-editor-block {
       --code-block-bg: color-mix(in srgb, var(--vscode-foreground) 5%, var(--chat-surface));
@@ -2783,6 +3203,44 @@ export class ChatViewProvider {
       gap: 8px;
       flex-shrink: 0;
     }
+    /* --- Always-visible "working" status (center of composer footer) --- */
+    .work-status {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      min-width: 0;
+      font-size: 0.74em;
+      color: var(--vscode-charts-teal, #4ec9b0);
+    }
+    .composer-footer.working .model-pricing { display: none !important; }
+    .composer-footer.working .work-status { display: inline-flex; }
+    .work-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .work-time {
+      margin-left: auto;
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+      opacity: 0.85;
+    }
+    .work-spinner {
+      width: 12px;
+      height: 12px;
+      flex-shrink: 0;
+      border-radius: 50%;
+      border: 2px solid currentColor;
+      border-top-color: transparent;
+      opacity: 0.75;
+      animation: workspin 0.8s linear infinite;
+    }
+    @keyframes workspin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .work-spinner { animation: none; border-top-color: currentColor; opacity: 0.5; }
+    }
     .composer.drag-over {
       border-color: var(--vscode-focusBorder);
       box-shadow: 0 0 0 1px var(--vscode-focusBorder);
@@ -3084,6 +3542,11 @@ export class ChatViewProvider {
           <span class="model-pricing-compact"></span>
           <span class="model-pricing-full"></span>
         </div>
+        <div id="workStatus" class="work-status" aria-live="polite">
+          <span class="work-spinner" aria-hidden="true"></span>
+          <span class="work-text">Working…</span>
+          <span class="work-time"></span>
+        </div>
         <div class="composer-right">
           <button type="button" id="attachBtn" class="attach-btn" title="Add files or images" aria-label="Add files">
             <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11.5 4.5l-5.2 5.2a2.12 2.12 0 102.99 2.99l5.8-5.8a3.12 3.12 0 10-4.41-4.41L4.5 9.6" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/></svg>
@@ -3110,12 +3573,38 @@ export class ChatViewProvider {
     const attachBtn = document.getElementById('attachBtn');
     const sendBtn = document.getElementById('sendBtn');
     const sendSpinner = document.getElementById('sendSpinner');
+    const workStatusEl = document.getElementById('workStatus');
+    const composerFooterEl = document.querySelector('.composer-footer');
     const clearBtn = document.getElementById('clearBtn');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const deleteSessionBtn = document.getElementById('deleteSessionBtn');
 
     let processing = false;
     let thinkingEl = null;
+    // Request-level work clock — one continuous timer from send → final message,
+    // so the elapsed time and "working" indicator never disappear mid-request.
+    let workStartedAt = 0;
+    let workTimerId = null;
+    let working = false;
+    let workPhase = '';
+    let workDetail = '';
+    let streamIdleTimer = null;
+    let streamCursorWorking = false;
+    const STREAM_IDLE_FINISHING_MS = 1200;
+    // Gentle, honest reassurance shown inline while the model wraps up (the footer
+    // keeps the steady "Finishing up…"). Cycling keeps the wait feeling alive.
+    const FINISHING_PHRASES = [
+      'Working through the details…',
+      'Still working…',
+      'Almost there…',
+      'Polishing the response…',
+      'Wrapping things up…',
+    ];
+    let finishingIdx = 0;
+    let finishingTimer = null;
+    const FINISHING_CYCLE_MS = 3500;
+    let activityExpanded = null;
+    let lastActivity = null;
     let streamingEl = null;
     let streamingBody = null;
     let streamText = '';
@@ -3596,14 +4085,109 @@ export class ChatViewProvider {
       }
     }
 
-    function bindMessageLinks(body) {
-      body.addEventListener('click', (e) => {
-        const anchor = e.target.closest('a');
-        if (!anchor || !anchor.href) return;
-        e.preventDefault();
-        vscode.postMessage({ type: 'openLink', url: anchor.href });
+    // Move http(s) href -> data-href so the webview can't auto-open the link on click;
+    // opening is then handled only by our click handler (which shows the confirm dialog).
+    function neutralizeExternalLinks(root) {
+      if (!root) return;
+      root.querySelectorAll('a[href]').forEach(function (a) {
+        const href = a.getAttribute('href') || '';
+        if (/^https?:/i.test(href)) {
+          a.setAttribute('data-href', href);
+          a.removeAttribute('href');
+        }
       });
     }
+
+    function bindMessageLinks(body) {
+      if (!body) return;
+      neutralizeExternalLinks(body); // every call — re-renders produce fresh anchors
+      // Bind the click listener once per element (flushStreamRender re-runs this each tick).
+      if (body.dataset.linksBound === '1') return;
+      body.dataset.linksBound = '1';
+      body.addEventListener('click', (e) => {
+        const anchor = e.target.closest('a[data-href]');
+        if (!anchor) return;
+        e.preventDefault();
+        const href = anchor.getAttribute('data-href');
+        if (href) vscode.postMessage({ type: 'openLink', url: href });
+      });
+    }
+
+    // --- Clickable file mentions (verified to exist in the workspace) ---
+    const knownFiles = new Map(); // token written by the model -> canonical workspace path
+
+    function isFileToken(t) {
+      if (!t || t.length > 200 || /\\s/.test(t)) return false;
+      return /^(?:\\.\\/)?(?:[\\w.\\-]+\\/)*[\\w.\\-]+\\.[A-Za-z0-9]{1,12}$/.test(t);
+    }
+
+    function collectCodeFileSpans(root) {
+      const spans = [];
+      root.querySelectorAll('code').forEach(function (c) {
+        if (c.closest('pre')) return;            // skip fenced code blocks
+        if (c.classList.contains('file-link')) return;
+        const t = (c.textContent || '').trim();
+        if (isFileToken(t)) spans.push({ el: c, token: t });
+      });
+      return spans;
+    }
+
+    function applyFileLinkTo(el, token) {
+      const path = knownFiles.get(token);
+      if (!path) return;
+      el.classList.add('file-link');
+      el.setAttribute('data-path', path);
+      el.setAttribute('title', 'Open ' + path);
+      el.setAttribute('role', 'link');
+      el.setAttribute('tabindex', '0');
+      el.insertAdjacentHTML('afterbegin', stepIcon('read'));
+    }
+
+    function requestResolveFiles(tokens) {
+      const uniq = [];
+      const seen = {};
+      tokens.forEach(function (t) {
+        if (!seen[t] && !knownFiles.has(t)) { seen[t] = 1; uniq.push(t); }
+      });
+      if (uniq.length) vscode.postMessage({ type: 'resolveFiles', paths: uniq });
+    }
+
+    function linkifyFileMentions(root) {
+      if (!root) return;
+      const spans = collectCodeFileSpans(root);
+      if (!spans.length) return;
+      const unknown = [];
+      spans.forEach(function (s) {
+        if (knownFiles.has(s.token)) applyFileLinkTo(s.el, s.token);
+        else unknown.push(s.token);
+      });
+      requestResolveFiles(unknown);
+    }
+
+    function applyKnownFileLinksEverywhere() {
+      collectCodeFileSpans(messagesEl).forEach(function (s) {
+        if (knownFiles.has(s.token)) applyFileLinkTo(s.el, s.token);
+      });
+    }
+
+    function openFileLink(el) {
+      const p = el && el.getAttribute('data-path');
+      if (p) vscode.postMessage({ type: 'openFile', path: p });
+    }
+
+    messagesEl.addEventListener('click', function (e) {
+      const link = e.target.closest('.file-link');
+      if (!link) return;
+      e.preventDefault();
+      openFileLink(link);
+    });
+    messagesEl.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const link = e.target.closest('.file-link');
+      if (!link) return;
+      e.preventDefault();
+      openFileLink(link);
+    });
 
     messagesEl.addEventListener('click', (e) => {
       const btn = e.target.closest('.code-editor-copy');
@@ -3917,6 +4501,9 @@ export class ChatViewProvider {
 
     function removeStreamUi(removeNode) {
       bumpStreamRenderGeneration();
+      streamCursorWorking = false;
+      clearStreamIdleTimer();
+      stopFinishingCycle();
       if (streamRenderTimer) {
         clearTimeout(streamRenderTimer);
         streamRenderTimer = null;
@@ -3937,8 +4524,68 @@ export class ChatViewProvider {
       scrollToBottom(false);
     }
 
+    // The end-of-stream marker: a blinking caret while text is flowing, or — when the
+    // stream goes quiet but the model is still working (reading files, draining hidden
+    // reasoning) — an inline animated "working" chip showing the live phase.
+    function streamWorkingLabel() {
+      // Real action (reading/writing) shows verbatim; the idle "finishing" tail
+      // cycles gentle reassurance to keep the wait engaging.
+      if (workPhase === 'Finishing up…') {
+        return FINISHING_PHRASES[finishingIdx % FINISHING_PHRASES.length];
+      }
+      return workPhase || 'Working';
+    }
+
+    function makeStreamCursor() {
+      if (streamCursorWorking) {
+        var chip = document.createElement('span');
+        chip.className = 'stream-working';
+        chip.innerHTML =
+          '<span class="thinking-dots"><span></span><span></span><span></span></span>' +
+          '<span class="stream-working-label">' + escapeHtml(streamWorkingLabel()) + '</span>';
+        return chip;
+      }
+      var cursor = document.createElement('span');
+      cursor.className = 'stream-cursor';
+      cursor.textContent = '▍';
+      return cursor;
+    }
+
+    function startFinishingCycle() {
+      if (finishingTimer) return;
+      finishingIdx = 0;
+      finishingTimer = setInterval(function () {
+        finishingIdx = (finishingIdx + 1) % FINISHING_PHRASES.length;
+        if (streamCursorWorking && workPhase === 'Finishing up…') refreshStreamCursor();
+        else stopFinishingCycle();
+      }, FINISHING_CYCLE_MS);
+    }
+
+    function stopFinishingCycle() {
+      if (finishingTimer) { clearInterval(finishingTimer); finishingTimer = null; }
+    }
+
+    function refreshStreamCursor() {
+      if (!streamingBody) return;
+      var old = streamingBody.querySelector('.stream-cursor, .stream-working');
+      var next = makeStreamCursor();
+      if (old) old.replaceWith(next);
+      else streamingBody.appendChild(next);
+    }
+
+    function setStreamCursorWorking(on) {
+      if (!on) stopFinishingCycle();
+      if (streamCursorWorking === on) {
+        if (on) refreshStreamCursor(); // label may have changed
+        return;
+      }
+      streamCursorWorking = on;
+      refreshStreamCursor();
+    }
+
     function morphThinkingToStream() {
       removeStreamUi(false);
+      streamCursorWorking = false;
       var div = thinkingEl || document.getElementById('thinking-indicator');
       if (div) {
         thinkingEl = null;
@@ -3948,10 +4595,7 @@ export class ChatViewProvider {
         div.innerHTML = '';
         streamingBody = document.createElement('div');
         streamingBody.className = 'msg-body';
-        var cursor = document.createElement('span');
-        cursor.className = 'stream-cursor';
-        cursor.textContent = '▍';
-        streamingBody.appendChild(cursor);
+        streamingBody.appendChild(makeStreamCursor());
         div.appendChild(streamingBody);
         streamingEl = div;
       } else {
@@ -3960,10 +4604,7 @@ export class ChatViewProvider {
         streamingEl.className = 'msg assistant streaming';
         streamingBody = document.createElement('div');
         streamingBody.className = 'msg-body';
-        var cursorEl = document.createElement('span');
-        cursorEl.className = 'stream-cursor';
-        cursorEl.textContent = '▍';
-        streamingBody.appendChild(cursorEl);
+        streamingBody.appendChild(makeStreamCursor());
         streamingEl.appendChild(streamingBody);
         messagesEl.appendChild(streamingEl);
       }
@@ -3984,10 +4625,7 @@ export class ChatViewProvider {
           return;
         }
         body.innerHTML = formatContent(text, 'assistant');
-        var cursor = document.createElement('span');
-        cursor.className = 'stream-cursor';
-        cursor.textContent = '▍';
-        body.appendChild(cursor);
+        body.appendChild(makeStreamCursor());
         bindMessageLinks(body);
         wrapTables(body);
         scrollStreamIntoView();
@@ -4013,11 +4651,15 @@ export class ChatViewProvider {
       } else {
         removeThinking(true);
       }
+      setWorkPhase('Generating answer', '');
+      setStreamCursorWorking(false);
+      armStreamIdleFinishing();
       streamText = content || '';
       scheduleStreamRender();
     }
 
     function cancelAssistantStream() {
+      clearStreamIdleTimer();
       bumpStreamRenderGeneration();
       removeStreamUi(true);
     }
@@ -4025,6 +4667,9 @@ export class ChatViewProvider {
     function finishAssistantStream(content, details) {
       removeThinking(true);
       bumpStreamRenderGeneration();
+      streamCursorWorking = false;
+      clearStreamIdleTimer();
+      stopFinishingCycle();
       if (streamRenderTimer) {
         clearTimeout(streamRenderTimer);
         streamRenderTimer = null;
@@ -4035,12 +4680,15 @@ export class ChatViewProvider {
         el.classList.remove('streaming');
         el.classList.add('msg-enter');
         body.innerHTML = formatContent(content, 'assistant');
-        var stray = body.querySelector('.stream-cursor');
+        var stray = body.querySelector('.stream-cursor, .stream-working');
         if (stray) {
           stray.remove();
         }
         bindMessageLinks(body);
         wrapTables(body);
+        linkifyFileMentions(body);
+        buildActivitySummary(el);
+        lastActivity = null;
         appendToolDetails(el, details);
         scrollMessageIntoView(el, 'start', stickToBottom);
         streamingEl = null;
@@ -4093,9 +4741,12 @@ export class ChatViewProvider {
         body.innerHTML = formatContent(content, role);
         bindMessageLinks(body);
         wrapTables(body);
+        linkifyFileMentions(body);
         div.appendChild(body);
       }
       if (role === 'assistant') {
+        buildActivitySummary(div);
+        lastActivity = null;
         appendToolDetails(div, details);
       }
       messagesEl.appendChild(div);
@@ -4103,23 +4754,218 @@ export class ChatViewProvider {
       return div;
     }
 
-    function renderProcessHtml(completed, current, thought) {
-      let html = '';
-      if (completed && completed.length) {
-        html += '<ul class="process-log">';
-        completed.forEach((s) => {
-          html += '<li class="done">' + escapeHtml(s) + '</li>';
-        });
-        html += '</ul>';
+    function formatElapsed(ms) {
+      const s = Math.max(0, Math.round(ms / 1000));
+      const m = Math.floor(s / 60);
+      const sec = s % 60;
+      return m + ':' + (sec < 10 ? '0' : '') + sec;
+    }
+
+    const STEP_KIND_RULES = [
+      { re: /^(reading all|read matching|reading matching)/i, kind: 'glob' },
+      { re: /matching files|files matching/i, kind: 'glob' },
+      { re: /^(reading) .*\\bfiles\\b/i, kind: 'read' },
+      { re: /^(reading|read) /i, kind: 'read' },
+      { re: /^(exploring|explored)/i, kind: 'search' },
+      { re: /^(preparing|updated|writing|wrote|file written)/i, kind: 'write' },
+      { re: /^(running|ran|started in background)/i, kind: 'run' },
+      { re: /^(thinking|understanding|writing your answer|summariz|planning|gathering|verifying|auto-reading|checking)/i, kind: 'think' },
+    ];
+
+    function stepKind(text) {
+      for (let i = 0; i < STEP_KIND_RULES.length; i++) {
+        if (STEP_KIND_RULES[i].re.test(text)) return STEP_KIND_RULES[i].kind;
       }
-      html +=
-        '<div class="thinking-row">' +
-        '<div class="thinking-dots"><span></span><span></span><span></span></div>' +
-        '<span class="thinking-label">' + escapeHtml(current || 'Thinking…') + '</span></div>';
+      return 'dot';
+    }
+
+    function cleanStepText(raw) {
+      let t = String(raw || '').trim();
+      t = t.replace(/^Step\\s+\\d+:\\s*/i, '');
+      t = t.replace(/\\s*—\\s*done\\s*$/i, '');
+      t = t.replace(/…+$/, '').trim();
+      return t;
+    }
+
+    // Escape, then monospace any inline \`code\` and trailing file paths / globs.
+    function highlightStepPath(text) {
+      let esc = escapeHtml(text);
+      esc = esc.replace(/\`([^\`]+)\`/g, '<span class="step-path">$1</span>');
+      esc = esc.replace(
+        /(^|[\\s(])((?:[\\w.\\-]+\\/)*[\\w.\\-]+\\.[\\w]+|\\*\\*\\/[\\w*.\\/\\-]+|[\\w\\-]+\\/\\*\\*)(?=$|[\\s,.)])/g,
+        function (m, pre, p) { return pre + '<span class="step-path">' + p + '</span>'; }
+      );
+      return esc;
+    }
+
+    function formatStep(raw) {
+      const text = cleanStepText(raw);
+      return { kind: stepKind(text), text: text, html: highlightStepPath(text) };
+    }
+
+    // Collapse consecutive identical steps into one entry with a ×count.
+    function dedupeSteps(rawList) {
+      const out = [];
+      (rawList || []).forEach(function (raw) {
+        const f = formatStep(raw);
+        if (!f.text) return;
+        const last = out[out.length - 1];
+        if (last && last.text === f.text) { last.count++; }
+        else { out.push({ kind: f.kind, text: f.text, html: f.html, count: 1 }); }
+      });
+      return out;
+    }
+
+    function stepIcon(kind) {
+      const paths = {
+        think: '<path d="M8 1.8l1.3 4.9 4.9 1.3-4.9 1.3L8 14.2 6.7 9.3 1.8 8l4.9-1.3z"/>',
+        search: '<circle cx="7" cy="7" r="4.3"/><line x1="10.2" y1="10.2" x2="14" y2="14"/>',
+        read: '<path d="M4 1.7h5l3.3 3.3v9H4z"/><path d="M9 1.7V5h3.3"/>',
+        glob: '<path d="M5.5 3.2h4.2l2.8 2.8v6.3H5.5z"/><path d="M3.2 5.2v7.6h6"/>',
+        write: '<path d="M2.2 11.6l7.2-7.2 2.2 2.2-7.2 7.2H2.2z"/><path d="M8.6 3l2.2 2.2"/>',
+        run: '<rect x="1.6" y="2.6" width="12.8" height="10.8" rx="1.6"/><path d="M4.3 6.2l2.4 1.9-2.4 1.9"/><line x1="7.8" y1="10.3" x2="10.8" y2="10.3"/>',
+        check: '<path d="M3 8.4l3 3 7-7"/>',
+        dot: '<circle cx="8" cy="8" r="2.4"/>'
+      };
+      const inner = paths[kind] || paths.dot;
+      return '<svg class="step-icon step-icon-' + kind + '" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + '</svg>';
+    }
+
+    function stepListHtml(steps) {
+      let html = '<ul class="activity-steps">';
+      steps.forEach(function (s) {
+        html += '<li class="activity-step">' + stepIcon(s.kind) +
+          '<span class="activity-step-text">' + s.html +
+          (s.count > 1 ? ' <span class="activity-step-count">×' + s.count + '</span>' : '') +
+          '</span></li>';
+      });
+      html += '</ul>';
+      return html;
+    }
+
+    function renderProcessHtml(completed, current, thought) {
+      const steps = dedupeSteps(completed);
+      // Stash the latest activity so a summary can be shown on the finished message.
+      lastActivity = { steps: steps, startedAt: workStartedAt };
+      const cur = formatStep(current || 'Thinking…');
+      const elapsed = workStartedAt ? formatElapsed(Date.now() - workStartedAt) : '';
+      let html =
+        '<div class="activity-header">' +
+        '<span class="activity-cur-icon">' + stepIcon(cur.kind) + '</span>' +
+        '<span class="activity-cur-label">' + (cur.html || 'Thinking…') + '</span>' +
+        '<span class="thinking-dots"><span></span><span></span><span></span></span>' +
+        '<span class="activity-elapsed"' + (elapsed ? '' : ' style="display:none"') + '>' + elapsed + '</span>' +
+        '</div>';
+      if (steps.length) {
+        html +=
+          '<details class="activity-collapse">' +
+          '<summary class="activity-toggle"><span class="activity-chevron"></span>' +
+          steps.length + ' step' + (steps.length === 1 ? '' : 's') + '</summary>' +
+          stepListHtml(steps) +
+          '</details>';
+      }
       if (thought) {
         html += '<div class="thinking-thought">' + escapeHtml(thought) + '</div>';
       }
       return html;
+    }
+
+    function wireActivityToggle(root) {
+      const det = root.querySelector('.activity-collapse');
+      if (!det) return;
+      const count = det.querySelectorAll('.activity-step').length;
+      det.open = activityExpanded === null ? count <= 3 : activityExpanded;
+      det.addEventListener('toggle', function () { activityExpanded = det.open; });
+    }
+
+    function formatBytes(n) {
+      if (!n || n < 0) return '';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    function toolProgressLabel(name) {
+      switch (name) {
+        case 'propose_write_file': return 'Writing file';
+        case 'run_command': return 'Preparing command';
+        case 'read_file':
+        case 'read_glob':
+        case 'list_files': return 'Reading workspace';
+        default: return 'Working';
+      }
+    }
+
+    // One request-level heartbeat: keeps the composer timer and the inline
+    // thinking timer ticking continuously, even through silent stretches.
+    function workHeartbeat() {
+      renderWorkStatus();
+      if (thinkingEl && workStartedAt) {
+        const el = thinkingEl.querySelector('.activity-elapsed');
+        if (el) {
+          el.textContent = formatElapsed(Date.now() - workStartedAt);
+          el.style.display = '';
+        }
+      }
+    }
+
+    function renderWorkStatus() {
+      if (!workStatusEl || !working) return;
+      const txt = workStatusEl.querySelector('.work-text');
+      const tm = workStatusEl.querySelector('.work-time');
+      if (txt) txt.textContent = (workPhase || 'Working…') + (workDetail ? ' · ' + workDetail : '');
+      if (tm) tm.textContent = workStartedAt ? formatElapsed(Date.now() - workStartedAt) : '';
+    }
+
+    function startWork() {
+      if (!working) {
+        working = true;
+        workStartedAt = Date.now();
+        activityExpanded = null;
+        workPhase = '';
+        workDetail = '';
+      }
+      if (composerFooterEl) composerFooterEl.classList.add('working');
+      if (!workTimerId) workTimerId = setInterval(workHeartbeat, 1000);
+      renderWorkStatus();
+    }
+
+    function stopWork() {
+      working = false;
+      clearStreamIdleTimer();
+      stopFinishingCycle();
+      if (workTimerId) { clearInterval(workTimerId); workTimerId = null; }
+      if (composerFooterEl) composerFooterEl.classList.remove('working');
+    }
+
+    function setWorkPhase(phase, detail) {
+      if (!working) return;
+      if (phase != null) workPhase = phase;
+      workDetail = detail != null ? detail : '';
+      if (workPhase !== 'Finishing up…') stopFinishingCycle();
+      renderWorkStatus();
+      if (streamCursorWorking) refreshStreamCursor();
+    }
+
+    function clearStreamIdleTimer() {
+      if (streamIdleTimer) { clearTimeout(streamIdleTimer); streamIdleTimer = null; }
+    }
+
+    // The visible answer streams as the model's final channel; some models
+    // (e.g. owl-alpha) keep emitting hidden reasoning afterwards, which we strip.
+    // When visible output goes quiet but the request is still open, say "Finishing up..."
+    // rather than leaving "Generating answer" - honest, and never truncates the model.
+    function armStreamIdleFinishing() {
+      clearStreamIdleTimer();
+      streamIdleTimer = setTimeout(function () {
+        streamIdleTimer = null;
+        if (!(working && streamingEl)) return;
+        // Only relabel the composer when we were streaming the answer (final tail).
+        // Tool phases ("Reading workspace" / "Writing file") must stay as-is.
+        if (workPhase === 'Generating answer') setWorkPhase('Finishing up…', '');
+        setStreamCursorWorking(true);
+        if (workPhase === 'Finishing up…') startFinishingCycle();
+      }, STREAM_IDLE_FINISHING_MS);
     }
 
     function showThinking(label, process) {
@@ -4134,6 +4980,7 @@ export class ChatViewProvider {
         '<div class="thinking-body">' +
         renderProcessHtml(completed, current, thought) +
         '</div>';
+      wireActivityToggle(thinkingEl);
       messagesEl.appendChild(thinkingEl);
       scrollMessageIntoView(thinkingEl, 'end', stickToBottom);
     }
@@ -4149,6 +4996,7 @@ export class ChatViewProvider {
       const body = thinkingEl.querySelector('.thinking-body');
       if (body) {
         body.innerHTML = renderProcessHtml(completed, current, thought);
+        wireActivityToggle(thinkingEl);
       }
       scrollMessageIntoView(thinkingEl, 'end', stickToBottom);
     }
@@ -4168,6 +5016,26 @@ export class ChatViewProvider {
       setTimeout(() => {
         if (el.parentNode) el.remove();
       }, 300);
+    }
+
+    // Slim "Worked for Xs · N steps" collapsible, prepended to a finished assistant message.
+    function buildActivitySummary(parent) {
+      if (!lastActivity || !lastActivity.steps || !lastActivity.steps.length) return;
+      const steps = lastActivity.steps;
+      const elapsed = lastActivity.startedAt ? formatElapsed(Date.now() - lastActivity.startedAt) : '';
+      const det = document.createElement('details');
+      det.className = 'activity-summary';
+      const sum = document.createElement('summary');
+      sum.innerHTML = stepIcon('check') +
+        '<span class="activity-summary-label">Worked' + (elapsed ? ' for ' + elapsed : '') +
+        ' · ' + steps.length + ' step' + (steps.length === 1 ? '' : 's') + '</span>' +
+        '<span class="activity-chevron"></span>';
+      det.appendChild(sum);
+      const wrap = document.createElement('div');
+      wrap.innerHTML = stepListHtml(steps);
+      const ul = wrap.firstChild;
+      if (ul) det.appendChild(ul);
+      parent.insertBefore(det, parent.firstChild);
     }
 
     function shortModelLabel(id) {
@@ -4454,8 +5322,11 @@ export class ChatViewProvider {
       clearBtn.disabled = loading || approvalPending;
       updateSendButton();
       if (loading) {
-        sendSpinner.classList.remove('hidden');
+        startWork();
+        const phaseRaw = (process && process.current) || label || '';
+        if (phaseRaw) setWorkPhase(cleanStepText(phaseRaw), '');
         if (streamingEl) {
+          updateJumpToBottomButton();
           return;
         }
         if (thinkingEl) {
@@ -4464,7 +5335,7 @@ export class ChatViewProvider {
           showThinking(label, process);
         }
       } else {
-        sendSpinner.classList.add('hidden');
+        stopWork();
         removeThinking(false);
       }
       updateJumpToBottomButton();
@@ -4568,10 +5439,21 @@ export class ChatViewProvider {
           break;
         case 'assistantStreamStart':
           morphThinkingToStream();
+          setWorkPhase('Generating answer', '');
           updateJumpToBottomButton();
           break;
         case 'assistantPartial':
           updateAssistantPartial(msg.content);
+          break;
+        case 'toolProgress':
+          setWorkPhase(toolProgressLabel(msg.name), formatBytes(msg.bytes));
+          if (streamingEl) setStreamCursorWorking(true);
+          break;
+        case 'filesResolved':
+          (msg.files || []).forEach(function (f) {
+            if (f && f.input && f.path) knownFiles.set(f.input, f.path);
+          });
+          applyKnownFileLinksEverywhere();
           break;
         case 'assistantStreamCancel':
           cancelAssistantStream();

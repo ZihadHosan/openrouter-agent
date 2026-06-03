@@ -30,6 +30,8 @@ export interface OpenRouterModelEntry {
   completionPerToken: string;
   imagePerUnit: string;
   supportsVision: boolean;
+  /** True when the model advertises native function/tool calling. */
+  supportsTools?: boolean;
 }
 
 export interface CatalogPickerItem {
@@ -55,6 +57,7 @@ interface ApiModelRow {
     completion?: string;
     image?: string;
   };
+  supported_parameters?: string[];
 }
 
 /** Regex fallback when catalog entry is missing. */
@@ -232,6 +235,10 @@ function rowToEntry(row: ApiModelRow): OpenRouterModelEntry | null {
   const modalities = row.architecture?.input_modalities;
   const supportsVision =
     supportsVisionFromModalities(modalities) || modelSupportsVisionRegex(id);
+  const params = row.supported_parameters;
+  const supportsTools = Array.isArray(params)
+    ? params.includes('tools')
+    : undefined;
   return {
     id,
     created: row.created,
@@ -240,6 +247,7 @@ function rowToEntry(row: ApiModelRow): OpenRouterModelEntry | null {
     completionPerToken: row.pricing?.completion ?? '0',
     imagePerUnit: row.pricing?.image ?? '0',
     supportsVision,
+    supportsTools,
   };
 }
 
@@ -358,6 +366,20 @@ export class ModelPricingCache {
       return entry.supportsVision;
     }
     return modelSupportsVisionRegex(modelId);
+  }
+
+  /**
+   * True when the model accepts a native `tools` array.
+   * Defaults to true for unknown ids (frontier paid models all support it);
+   * the catalog marks free/text-only ids false once loaded, routing them to the
+   * prompt-based agent-tool fallback.
+   */
+  supportsTools(modelId: string): boolean {
+    const entry = this.byId.get(modelId);
+    if (entry && typeof entry.supportsTools === 'boolean') {
+      return entry.supportsTools;
+    }
+    return true;
   }
 
   poolHasVisionModel(modelIds: string[]): boolean {

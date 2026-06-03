@@ -1,0 +1,60 @@
+[
+  {
+    "id": "kimi-list-files-complete",
+    "input": "I'll look around.\n<|tool_calls_section_begin|>\n<|tool_call_begin_kimi|>functions.list_files:0<|tool_call_argument_begin|>{\"pattern\":\"**/*\",\"maxResults\":50}\n<|tool_call_end_kimi|>\n<|tool_calls_section_end|>",
+    "mustNotContain": ["<|", "functions.list_files"],
+    "expectHasControl": true,
+    "expectTool": "list_files"
+  },
+  {
+    "id": "kimi-truncated-stream",
+    "input": "Checking config.\n<|tool_calls_section_begin|>\n<|tool_call_begin|>functions.list_files:0<|tool_call_argument_begin|>{\"pattern",
+    "mustNotContain": ["<|", "functions.list_files"],
+    "expectHasControl": true
+  },
+  {
+    "id": "function-call-openai-style",
+    "input": "<|function_calls_begin|><|function_call_begin|>list_files<|function_sep|>{\"pattern\":\"**/*.md\"}<|function_call_end|><|function_calls_end|>",
+    "mustNotContain": ["<|"],
+    "expectHasControl": true,
+    "expectTool": "list_files"
+  },
+  {
+    "id": "agent-tool-block",
+    "input": "Reading file.\n```agent-tool\n{\"tool\":\"read_file\",\"path\":\"README.md\"}\n```",
+    "mustNotContain": ["<|"],
+    "expectHasControl": false,
+    "expectTool": "read_file"
+  },
+  {
+    "id": "channel-final-prose",
+    "input": "<|channel|>final<|message|>The project uses PostgreSQL via Prisma.",
+    "mustNotContain": ["<|"],
+    "expectVisibleContains": "PostgreSQL"
+  },
+  {
+    "id": "plain-prose",
+    "input": "No tools here — just an answer about the repo.",
+    "mustNotContain": ["<|"],
+    "expectHasControl": false,
+    "expectVisibleContains": "No tools here"
+  },
+  {
+    "id": "owl-channel-functions",
+    "input": "<|channel|>functions<|message|>```agent-tool\n{\"tool\":\"list_files\",\"pattern\":\"**/*\"}\n```\n<|channel|>final<|message|>I'll explore the project structure.",
+    "mustNotContain": ["<|"],
+    "expectTool": "list_files"
+  },
+  {
+    "id": "claude-truncated-agent-fence",
+    "input": "I'll explore the project.\n```agent\n{\"tool\":\"list_files\",\"pattern\":\"**/*\"}",
+    "mustNotContain": ["<|"],
+    "expectTool": "list_files"
+  },
+  {
+    "id": "unknown-future-token",
+    "input": "Intro\n<|vendor_xyz_tool_invoke_v99|>{\"tool\":\"list_files\",\"pattern\":\"**/*\"}",
+    "mustNotContain": ["<|"],
+    "expectHasControl": true
+  }
+]

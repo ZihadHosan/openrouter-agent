@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
 
 export const AUTO_MODEL_ID = '__auto__';
-/** Default model when user has never chosen one (first install). */
-export const DEFAULT_FIRST_MODEL_ID = 'z-ai/glm-4.5-air:free';
+/** Default model when user has never chosen one (first install) and for every new chat. */
+export const DEFAULT_FIRST_MODEL_ID = 'openrouter/owl-alpha';
 
 const CUSTOM_MODELS_KEY = 'openrouterAgent.customModels';
 const SELECTED_MODEL_KEY = 'openrouterAgent.selectedModel';
@@ -15,7 +15,7 @@ export const MIN_AUTO_POOL_SIZE = 3;
 /** First-install Auto pool seed (not exposed in VS Code Settings). */
 export const DEFAULT_POOL_SEED_IDS = [
   DEFAULT_FIRST_MODEL_ID,
-  'openrouter/owl-alpha',
+  'z-ai/glm-4.5-air:free',
   'openai/gpt-oss-20b:free',
 ];
 
