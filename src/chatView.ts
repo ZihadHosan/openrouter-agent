@@ -262,6 +262,7 @@ export class ChatViewProvider {
     id?: string;
     choice?: string;
     url?: string;
+    query?: string;
     files?: { name: string; mimeType: string; base64: string }[];
     attachmentIds?: string[];
     path?: string;
@@ -288,6 +289,11 @@ export class ChatViewProvider {
           String(msg.modelId ?? AUTO_MODEL_ID)
         );
         break;
+      case 'findMentionFiles': {
+        const query = String(msg.query ?? '');
+        await this.handleFindMentionFiles(query);
+        break;
+      }
       case 'pickAttachments':
         if (this.processing) {
           break;
@@ -859,6 +865,12 @@ export class ChatViewProvider {
       return;
     }
 
+    // Extract and resolve file mentions
+    const { parseFileMentions, stripFileMentions, resolveFilePaths } = await import('./fileMentions');
+    const mentions = parseFileMentions(trimmed);
+    const mentionedPaths = await resolveFilePaths(mentions.map((m) => m.path));
+    const visibleText = stripFileMentions(trimmed);
+
     const needsWorkspace = mode === 'agent' || mode === 'ask';
     if (needsWorkspace && !vscode.workspace.workspaceFolders?.length) {
       this.post({
@@ -923,7 +935,7 @@ export class ChatViewProvider {
         pool,
         {
           mode,
-          userMessage: trimmed,
+          userMessage: visibleText,
           conversationLength: this.history.length,
           hasVisionAttachments: true,
         },
@@ -958,18 +970,43 @@ export class ChatViewProvider {
       committed.length > 0 || mode === 'ask' || mode === 'agent';
     this.beginRequest();
 
+    // Read mentioned files and add to context for the model
+    let mentionedFilesContext = '';
+    if (mentionedPaths.length > 0) {
+      const fileContents: string[] = [];
+      for (const filePath of mentionedPaths) {
+        try {
+          if (vscode.workspace.workspaceFolders?.length) {
+            for (const folder of vscode.workspace.workspaceFolders) {
+              const uri = vscode.Uri.joinPath(folder.uri, filePath);
+              const data = await vscode.workspace.fs.readFile(uri);
+              const content = new TextDecoder().decode(data);
+              fileContents.push(`File: ${filePath}\n\`\`\`\n${content}\n\`\`\``);
+              break;
+            }
+          }
+        } catch {
+          fileContents.push(`File: ${filePath}\n(Could not read file)`);
+        }
+      }
+      if (fileContents.length > 0) {
+        mentionedFilesContext = '\n\nMentioned files:\n' + fileContents.join('\n\n');
+      }
+    }
+
+    const fullContent = visibleText + mentionedFilesContext;
     const userMsg: ChatSessionMessage = {
       role: 'user',
-      content: trimmed,
+      content: fullContent,
       attachments: committed.length ? committed : undefined,
     };
     this.history.push(userMsg);
-    await this.persistSession(trimmed || committed[0]?.name);
+    await this.persistSession(visibleText || committed[0]?.name);
 
     const userAttachmentsForUi = await this.enrichAttachmentsForUi(sessionId, committed);
     this.post({
       type: 'userMessage',
-      content: trimmed,
+      content: visibleText,
       attachments: userAttachmentsForUi,
     });
     this.post({
@@ -985,7 +1022,7 @@ export class ChatViewProvider {
               pool,
               {
                 mode,
-                userMessage: trimmed,
+                userMessage: visibleText,
                 conversationLength: this.history.length,
                 hasVisionAttachments: this.hasVisionInRequest,
               },
@@ -1143,6 +1180,21 @@ export class ChatViewProvider {
       });
     }
     return row;
+  }
+
+  private async handleFindMentionFiles(query: string): Promise<void> {
+    if (!vscode.workspace.workspaceFolders?.length) {
+      this.post({ type: 'mentionFiles', files: [] });
+      return;
+    }
+
+    try {
+      const { findWorkspaceFiles } = await import('./fileMentions');
+      const files = await findWorkspaceFiles(query, 20);
+      this.post({ type: 'mentionFiles', files });
+    } catch {
+      this.post({ type: 'mentionFiles', files: [] });
+    }
   }
 
   private async runToolLoop(
@@ -3511,6 +3563,38 @@ export class ChatViewProvider {
     .terminal-status.running::before { content: '● '; color: var(--vscode-progressBar-background, #007acc); }
     .terminal-status.ok::before { content: '✓ '; }
     .terminal-status.error::before { content: '✗ '; }
+    .mention-dropdown {
+      position: fixed;
+      display: none;
+      max-width: 300px;
+      max-height: 200px;
+      overflow-y: auto;
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border);
+      border-radius: 4px;
+      box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.3));
+      z-index: 10000;
+      font-size: 0.85em;
+    }
+    .mention-dropdown.show {
+      display: block;
+    }
+    .mention-item {
+      padding: 6px 10px;
+      cursor: pointer;
+      color: var(--vscode-foreground);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .mention-item:hover, .mention-item.selected {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .mention-item-icon {
+      display: inline-block;
+      margin-right: 4px;
+      opacity: 0.7;
+    }
   </style>
 </head>
 <body>
@@ -3532,7 +3616,8 @@ export class ChatViewProvider {
         <div id="accountBalance" class="account-balance hidden" role="status" aria-live="polite"></div>
       </div>
       <div id="attachmentBar" class="attachment-bar"></div>
-      <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — attach, paste, or drop images — Enter to send"></textarea>
+      <div id="mentionDropdown" class="mention-dropdown"></div>
+      <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — attach, paste, or drop images — @ for files — Enter to send"></textarea>
       <div class="composer-footer">
         <div class="composer-left">
           <div id="modeDropdown"></div>
@@ -3570,6 +3655,7 @@ export class ChatViewProvider {
     const inputEl = document.getElementById('input');
     const composerEl = document.getElementById('composer');
     const attachmentBar = document.getElementById('attachmentBar');
+    const mentionDropdownEl = document.getElementById('mentionDropdown');
     const modelPricingEl = document.getElementById('modelPricing');
     const accountBalanceEl = document.getElementById('accountBalance');
     const attachBtn = document.getElementById('attachBtn');
@@ -3580,6 +3666,13 @@ export class ChatViewProvider {
     const clearBtn = document.getElementById('clearBtn');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const deleteSessionBtn = document.getElementById('deleteSessionBtn');
+
+    // File mention system
+    let mentionActive = false;
+    let mentionStartPos = -1;
+    let mentionQuery = '';
+    let mentionIndex = -1;
+    let mentionCandidates = [];
 
     let processing = false;
     let thinkingEl = null;
@@ -5343,6 +5436,118 @@ export class ChatViewProvider {
       updateJumpToBottomButton();
     }
 
+    function closeMentionDropdown() {
+      mentionActive = false;
+      mentionDropdownEl.classList.remove('show');
+      mentionDropdownEl.innerHTML = '';
+    }
+
+    function updateMentionDropdown() {
+      const text = inputEl.value;
+      const cursorPos = inputEl.selectionStart;
+
+      // Find @ before cursor
+      let atPos = -1;
+      for (let i = cursorPos - 1; i >= 0; i--) {
+        if (text[i] === '@') {
+          // Check that @ is after space/newline or at start
+          if (i === 0 || /[\s\n]/.test(text[i - 1])) {
+            atPos = i;
+            break;
+          }
+        } else if (!/[a-zA-Z0-9._/-]/.test(text[i])) {
+          break;
+        }
+      }
+
+      if (atPos === -1) {
+        closeMentionDropdown();
+        return;
+      }
+
+      // Extract query from @ to cursor
+      mentionQuery = text.slice(atPos + 1, cursorPos).trim();
+      if (!mentionQuery && atPos < cursorPos - 1) {
+        // @ followed by space, show dropdown
+        mentionQuery = '';
+      }
+
+      if (mentionQuery === undefined) {
+        closeMentionDropdown();
+        return;
+      }
+
+      mentionStartPos = atPos;
+      mentionActive = true;
+
+      // Request files from backend
+      vscode.postMessage({
+        type: 'findMentionFiles',
+        query: mentionQuery
+      });
+    }
+
+    function renderMentionDropdown(files) {
+      mentionCandidates = files || [];
+      mentionIndex = -1;
+
+      if (!mentionActive || mentionCandidates.length === 0) {
+        closeMentionDropdown();
+        return;
+      }
+
+      mentionDropdownEl.innerHTML = '';
+      mentionCandidates.forEach((file, idx) => {
+        const item = document.createElement('div');
+        item.className = 'mention-item' + (idx === mentionIndex ? ' selected' : '');
+        const icon = document.createElement('span');
+        icon.className = 'mention-item-icon';
+        icon.textContent = '📄 ';
+        item.appendChild(icon);
+        item.appendChild(document.createTextNode(file));
+        item.dataset.index = idx;
+        item.addEventListener('click', () => insertMention(file));
+        item.addEventListener('mouseenter', () => {
+          mentionIndex = idx;
+          updateMentionItemSelection();
+        });
+        mentionDropdownEl.appendChild(item);
+      });
+
+      mentionDropdownEl.classList.add('show');
+      positionMentionDropdown();
+    }
+
+    function updateMentionItemSelection() {
+      mentionDropdownEl.querySelectorAll('.mention-item').forEach((item, idx) => {
+        item.classList.toggle('selected', idx === mentionIndex);
+      });
+    }
+
+    function positionMentionDropdown() {
+      const rect = inputEl.getBoundingClientRect();
+      mentionDropdownEl.style.top = (rect.top - 10) + 'px';
+      mentionDropdownEl.style.left = rect.left + 'px';
+      mentionDropdownEl.style.width = rect.width + 'px';
+    }
+
+    function insertMention(file) {
+      const text = inputEl.value;
+      const cursorPos = inputEl.selectionStart;
+
+      // Remove the @query part
+      const before = text.slice(0, mentionStartPos);
+      const after = text.slice(cursorPos);
+      const newText = before + '@' + file + ' ' + after;
+
+      inputEl.value = newText;
+      const newCursorPos = mentionStartPos + 1 + file.length + 1;
+      inputEl.setSelectionRange(newCursorPos, newCursorPos);
+
+      closeMentionDropdown();
+      inputEl.focus();
+    }
+
     function send() {
       const text = inputEl.value.trim();
       if ((!text && !pendingAttachments.length) || processing) return;
@@ -5386,6 +5591,31 @@ export class ChatViewProvider {
       vscode.postMessage({ type: 'deleteSession', sessionId: sessionDropdown.getValue() });
     });
     inputEl.addEventListener('keydown', (e) => {
+      if (mentionActive && mentionCandidates.length > 0) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          mentionIndex = Math.min(mentionIndex + 1, mentionCandidates.length - 1);
+          updateMentionItemSelection();
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          mentionIndex = Math.max(mentionIndex - 1, -1);
+          updateMentionItemSelection();
+          return;
+        }
+        if (e.key === 'Enter' && mentionIndex >= 0) {
+          e.preventDefault();
+          insertMention(mentionCandidates[mentionIndex]);
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          closeMentionDropdown();
+          return;
+        }
+      }
+
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         if (!processing) {
@@ -5393,6 +5623,8 @@ export class ChatViewProvider {
         }
       }
     });
+    inputEl.addEventListener('input', updateMentionDropdown);
+    inputEl.addEventListener('click', updateMentionDropdown);
     inputEl.addEventListener('paste', handlePasteAttachments);
 
     window.addEventListener('message', (event) => {
@@ -5456,6 +5688,9 @@ export class ChatViewProvider {
             if (f && f.input && f.path) knownFiles.set(f.input, f.path);
           });
           applyKnownFileLinksEverywhere();
+          break;
+        case 'mentionFiles':
+          renderMentionDropdown(msg.files);
           break;
         case 'assistantStreamCancel':
           cancelAssistantStream();

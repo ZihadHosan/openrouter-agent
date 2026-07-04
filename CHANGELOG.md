@@ -10,6 +10,7 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 ## [Unreleased]
 
 ### Added
+- **File mentions** — type `@` in the composer to select and attach files; dropdown searches workspace, supports arrow navigation and Enter to select, multi-file mentions for batch context.
 - **Composer busy border** — a teal gradient “snake” (~50% of the edge, blunt lead and soft tail) travels slowly on a 1px ring while a prompt runs; static border removed while busy; reduced-motion uses static border only.
 - **Composer balance badge** — shows OpenRouter credit balance (teal when positive, orange at $0) in the top-right of the message box when the API returns account or per-key limit data.
 - **Full OpenRouter model picker** — searchable catalog with **Free** / **Paid** tabs; scrollable menu (~280px). **Auto** mode uses on/off toggles (min 3 models); paid-model tip in the Auto banner.
