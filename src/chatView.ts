@@ -859,6 +859,16 @@ export class ChatViewProvider {
       return;
     }
 
+    // Extract and process @file mentions
+    const { parseFileMentions, stripFileMentions, readMentionedFiles } = await import(
+      './fileMentions'
+    );
+    const mentions = parseFileMentions(trimmed);
+    const visibleText = stripFileMentions(trimmed);
+    const mentionedFilesPaths = mentions.map((m) => m.path);
+    const mentionedFilesContext = await readMentionedFiles(mentionedFilesPaths);
+    const fullContent = visibleText + mentionedFilesContext;
+
     const needsWorkspace = mode === 'agent' || mode === 'ask';
     if (needsWorkspace && !vscode.workspace.workspaceFolders?.length) {
       this.post({
@@ -960,16 +970,16 @@ export class ChatViewProvider {
 
     const userMsg: ChatSessionMessage = {
       role: 'user',
-      content: trimmed,
+      content: fullContent,
       attachments: committed.length ? committed : undefined,
     };
     this.history.push(userMsg);
-    await this.persistSession(trimmed || committed[0]?.name);
+    await this.persistSession(visibleText || committed[0]?.name);
 
     const userAttachmentsForUi = await this.enrichAttachmentsForUi(sessionId, committed);
     this.post({
       type: 'userMessage',
-      content: trimmed,
+      content: visibleText,
       attachments: userAttachmentsForUi,
     });
     this.post({
@@ -985,7 +995,7 @@ export class ChatViewProvider {
               pool,
               {
                 mode,
-                userMessage: trimmed,
+                userMessage: visibleText,
                 conversationLength: this.history.length,
                 hasVisionAttachments: this.hasVisionInRequest,
               },
