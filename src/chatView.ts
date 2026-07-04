@@ -863,43 +863,35 @@ export class ChatViewProvider {
     let visibleText = trimmed;
     let fullContent = trimmed;
 
-    // Parse @file mentions
-    const mentionRegex = /(^|[\s\n])@([^\s\n]+)/g;
-    const mentions: { path: string; startIdx: number; endIdx: number }[] = [];
-    let match;
-    while ((match = mentionRegex.exec(trimmed)) !== null) {
-      const leadingChar = match[1];
-      const atIdx = match.index + leadingChar.length;
-      const pathEnd = match.index + match[0].length;
-      const path = match[2];
-      mentions.push({ path, startIdx: atIdx, endIdx: pathEnd });
+    // Simple @mention parsing: find @word patterns
+    const atMatches = trimmed.match(/@(\S+)/g) || [];
+    const mentionedFiles: string[] = atMatches.map((m) => m.slice(1)); // Remove @ prefix
+
+    // Strip @mentions from visible text
+    if (mentionedFiles.length > 0) {
+      visibleText = trimmed.replace(/@\S+/g, '').trim();
     }
 
-    // Strip mentions from visible text
-    if (mentions.length > 0) {
-      let result = trimmed;
-      for (let i = mentions.length - 1; i >= 0; i--) {
-        const m = mentions[i];
-        result = result.slice(0, m.startIdx) + result.slice(m.endIdx);
-      }
-      visibleText = result;
-    }
-
-    // Read mentioned files
+    // Read mentioned files and build context
     fullContent = visibleText;
-    if (mentions.length > 0 && vscode.workspace.workspaceFolders?.length) {
+    if (mentionedFiles.length > 0 && vscode.workspace.workspaceFolders?.length) {
       const fileContents: string[] = [];
-      for (const mention of mentions) {
+      for (const filePath of mentionedFiles) {
+        let found = false;
         for (const folder of vscode.workspace.workspaceFolders) {
-          const uri = vscode.Uri.joinPath(folder.uri, mention.path);
+          const uri = vscode.Uri.joinPath(folder.uri, filePath);
           try {
             const data = await vscode.workspace.fs.readFile(uri);
             const content = new TextDecoder().decode(data);
-            fileContents.push(`File: ${mention.path}\n\`\`\`\n${content}\n\`\`\``);
+            fileContents.push(`File: ${filePath}\n\`\`\`\n${content}\n\`\`\``);
+            found = true;
             break;
           } catch {
-            // File not found in this folder, try next
+            // Try next folder
           }
+        }
+        if (!found) {
+          fileContents.push(`File: ${filePath}\n(File not found in workspace)`);
         }
       }
       if (fileContents.length > 0) {
