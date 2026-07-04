@@ -859,15 +859,53 @@ export class ChatViewProvider {
       return;
     }
 
-    // Extract and process @file mentions
-    const { parseFileMentions, stripFileMentions, readMentionedFiles } = await import(
-      './fileMentions'
-    );
-    const mentions = parseFileMentions(trimmed);
-    const visibleText = stripFileMentions(trimmed);
-    const mentionedFilesPaths = mentions.map((m) => m.path);
-    const mentionedFilesContext = await readMentionedFiles(mentionedFilesPaths);
-    const fullContent = visibleText + mentionedFilesContext;
+    // Extract and process @file mentions inline
+    let visibleText = trimmed;
+    let fullContent = trimmed;
+
+    // Parse @file mentions
+    const mentionRegex = /(^|[\s\n])@([^\s\n]+)/g;
+    const mentions: { path: string; startIdx: number; endIdx: number }[] = [];
+    let match;
+    while ((match = mentionRegex.exec(trimmed)) !== null) {
+      const leadingChar = match[1];
+      const atIdx = match.index + leadingChar.length;
+      const pathEnd = match.index + match[0].length;
+      const path = match[2];
+      mentions.push({ path, startIdx: atIdx, endIdx: pathEnd });
+    }
+
+    // Strip mentions from visible text
+    if (mentions.length > 0) {
+      let result = trimmed;
+      for (let i = mentions.length - 1; i >= 0; i--) {
+        const m = mentions[i];
+        result = result.slice(0, m.startIdx) + result.slice(m.endIdx);
+      }
+      visibleText = result;
+    }
+
+    // Read mentioned files
+    fullContent = visibleText;
+    if (mentions.length > 0 && vscode.workspace.workspaceFolders?.length) {
+      const fileContents: string[] = [];
+      for (const mention of mentions) {
+        for (const folder of vscode.workspace.workspaceFolders) {
+          const uri = vscode.Uri.joinPath(folder.uri, mention.path);
+          try {
+            const data = await vscode.workspace.fs.readFile(uri);
+            const content = new TextDecoder().decode(data);
+            fileContents.push(`File: ${mention.path}\n\`\`\`\n${content}\n\`\`\``);
+            break;
+          } catch {
+            // File not found in this folder, try next
+          }
+        }
+      }
+      if (fileContents.length > 0) {
+        fullContent = visibleText + '\n\nMentioned files:\n' + fileContents.join('\n\n');
+      }
+    }
 
     const needsWorkspace = mode === 'agent' || mode === 'ask';
     if (needsWorkspace && !vscode.workspace.workspaceFolders?.length) {
