@@ -28,6 +28,9 @@ Version numbers match `package.json` (auto-bumped on `src/` changes during `npm 
 - System prompts clarify text `agent-tool` format, parallel read tools, and that workspace files are readable via tools.
 
 ### Fixed
+- **Default model updated to `openrouter/free`** — dynamic OpenRouter free model routing replaces deprecated owl-alpha; fallbacks to GPT OSS 20B and Llama 3.3 if needed.
+- **Default model unavailable on install** — when the default model is no longer in OpenRouter catalog, extension auto-fallbacks to the first available model; users no longer see errors on first run.
+- **Unavailable model error message** — when selected model is no longer available, chat now shows actionable guidance: “Pick a different model from the model menu” or “Enable **Auto** with at least 3 models for automatic fallback routing.”
 - **False “could not verify files” error** — broad project questions (database, CMS, integrations) auto-read `package.json`, `README.md`, and `list_files` when models only emit planning prose; Harmony channel tool scan (owl-alpha) and truncated ` ```agent` fences (Claude); clearer error when tools never ran (not “wrong folder”).
 - **Native tool-call token leaks** — dynamic Harmony/control-token sanitizer strips unknown `<|…|>` wire formats (Kimi, OpenRouter, future variants) from chat streams and final replies; Kimi `tool_call_begin` + `functions.*` blocks are parsed into extension tools when JSON is complete; `npm run test:sanitize` fixture regression.
 - **Assistant message UI** — empty `json` / `tool` code fences no longer render copy-only shells; streaming cursor no longer blinks after the reply finishes (stale render race).

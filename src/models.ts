@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 
 export const AUTO_MODEL_ID = '__auto__';
 /** Default model when user has never chosen one (first install) and for every new chat. */
-export const DEFAULT_FIRST_MODEL_ID = 'openrouter/owl-alpha';
+export const DEFAULT_FIRST_MODEL_ID = 'openrouter/free';
 
 const CUSTOM_MODELS_KEY = 'openrouterAgent.customModels';
 const SELECTED_MODEL_KEY = 'openrouterAgent.selectedModel';
@@ -15,8 +15,15 @@ export const MIN_AUTO_POOL_SIZE = 3;
 /** First-install Auto pool seed (not exposed in VS Code Settings). */
 export const DEFAULT_POOL_SEED_IDS = [
   DEFAULT_FIRST_MODEL_ID,
-  'z-ai/glm-4.5-air:free',
   'openai/gpt-oss-20b:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
+];
+
+/** Priority order for model fallback when default is unavailable. */
+export const FALLBACK_MODEL_PRIORITY = [
+  'openrouter/free',
+  'openai/gpt-oss-20b:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
 ];
 
 export class ModelStore {
@@ -119,6 +126,32 @@ export class ModelStore {
       return { ok: true };
     }
     return { ok: true };
+  }
+
+  /**
+   * Fallback to first available model if selected model is not in catalog.
+   * Called after catalog loads to ensure the default model exists.
+   * Uses prioritized list: GLM 4.5, GPT OSS, Owl Alpha, then any available.
+   */
+  async validateSelectedModelOrFallback(validIds: Set<string>): Promise<void> {
+    const selectedId = this.getSelectedModelId();
+    if (validIds.has(selectedId)) {
+      return;
+    }
+
+    // Try priority list first
+    for (const modelId of FALLBACK_MODEL_PRIORITY) {
+      if (validIds.has(modelId)) {
+        await this.setSelectedModelId(modelId);
+        return;
+      }
+    }
+
+    // Fall back to any available model (alphabetically)
+    const fallback = Array.from(validIds).sort()[0];
+    if (fallback) {
+      await this.setSelectedModelId(fallback);
+    }
   }
 
   /**

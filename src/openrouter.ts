@@ -251,6 +251,15 @@ function appendProviderErrorHints(detail: string, status: number): string {
   }
 
   const d = detail.toLowerCase();
+
+  if (/unknown model|model not found|invalid model|does not exist/i.test(d)) {
+    return (
+      '\n\nThis model is no longer available. **What you can try:**' +
+      '\n- Pick a different model from the model menu.' +
+      '\n- Enable **Auto** with at least 3 models for automatic fallback routing.'
+    );
+  }
+
   const lines: string[] = ['\n\n**What you can try:**'];
 
   if (

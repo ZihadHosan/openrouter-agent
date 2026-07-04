@@ -630,7 +630,9 @@ export class ChatViewProvider {
     } catch {
       // use stale cache if any
     }
-    await this.modelStore.pruneAutoPoolToCatalog(cache.getCatalogIds());
+    const catalogIds = cache.getCatalogIds();
+    await this.modelStore.pruneAutoPoolToCatalog(catalogIds);
+    await this.modelStore.validateSelectedModelOrFallback(catalogIds);
     this.post({
       type: 'modelCatalog',
       catalog: cache.getCatalogForPicker(),
