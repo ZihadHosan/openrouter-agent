@@ -48,6 +48,8 @@ Most AI coding assistants lock you into one provider, one model, and a monthly s
 
 📎 **Image, PDF & file attachments** — paste screenshots (Win+Shift+S → Ctrl+V), attach PDFs, images, or source files. Vision-capable models analyze them directly.
 
+🗂️ **@ file mentions** — type `@` in the composer to search and select workspace files as you type; the selected file's content is read and included automatically, and shows as a clickable teal chip in your message.
+
 🔗 **Clickable file mentions** — when the AI mentions a file that exists in your workspace (e.g. `agents.md`), it becomes a clickable link that opens the file in a real editor tab.
 
 📊 **Live activity log** — a compact, collapsible step-by-step progress panel shows exactly what the agent is doing, how long it's taken, and what files it's reading or writing — with per-type icons and a ticking elapsed timer.
