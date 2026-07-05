@@ -266,6 +266,7 @@ export class ChatViewProvider {
     attachmentIds?: string[];
     path?: string;
     paths?: string[];
+    query?: string;
   }): Promise<void> {
     switch (msg.type) {
       case 'openFile':
@@ -274,6 +275,11 @@ export class ChatViewProvider {
       case 'resolveFiles':
         await this.resolveFileMentions(Array.isArray(msg.paths) ? msg.paths : []);
         break;
+      case 'findMentionFiles': {
+        const query = String(msg.query ?? '');
+        await this.handleFindMentionFiles(query);
+        break;
+      }
       case 'openLink': {
         const url = String(msg.url ?? '').trim();
         if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -848,6 +854,22 @@ export class ChatViewProvider {
     });
   }
 
+  private async handleFindMentionFiles(query: string): Promise<void> {
+    try {
+      const { findWorkspaceFiles } = await import('./fileMentions');
+      const files = await findWorkspaceFiles(query, 20);
+      this.post({
+        type: 'mentionFiles',
+        files: files || [],
+      });
+    } catch (err) {
+      this.post({
+        type: 'mentionFiles',
+        files: [],
+      });
+    }
+  }
+
   private async handleSend(
     text: string,
     mode: AgentMode,
@@ -866,11 +888,6 @@ export class ChatViewProvider {
     // Simple @mention parsing: find @word patterns
     const atMatches = trimmed.match(/@(\S+)/g) || [];
     const mentionedFiles: string[] = atMatches.map((m) => m.slice(1)); // Remove @ prefix
-
-    // Strip @mentions from visible text
-    if (mentionedFiles.length > 0) {
-      visibleText = trimmed.replace(/@\S+/g, '').trim();
-    }
 
     // Read mentioned files and build context
     fullContent = visibleText;
@@ -3052,6 +3069,7 @@ export class ChatViewProvider {
       container-name: composer;
       display: flex;
       flex-direction: column;
+      position: relative;
       border: 1px solid var(--vscode-input-border);
       border-radius: 10px;
       background: var(--vscode-input-background);
@@ -3159,7 +3177,28 @@ export class ChatViewProvider {
       outline: none;
       border-color: transparent;
     }
+    .input-wrap {
+      position: relative;
+    }
+    .input-highlight {
+      position: absolute;
+      inset: 0;
+      padding: 10px 12px 4px;
+      font-family: inherit;
+      font-size: inherit;
+      line-height: 1.45;
+      color: var(--vscode-input-foreground);
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      overflow: hidden;
+      pointer-events: none;
+      margin: 0;
+    }
+    .input-highlight .mention-chip {
+      color: var(--vscode-charts-teal, #4ec9b0);
+    }
     #input {
+      position: relative;
       width: 100%;
       min-height: 56px;
       max-height: 160px;
@@ -3167,7 +3206,8 @@ export class ChatViewProvider {
       font-family: inherit;
       font-size: inherit;
       line-height: 1.45;
-      color: var(--vscode-input-foreground);
+      color: transparent;
+      caret-color: var(--vscode-input-foreground);
       background: transparent;
       border: none;
       padding: 10px 12px 4px;
@@ -3175,6 +3215,9 @@ export class ChatViewProvider {
     }
     #input::placeholder {
       color: var(--vscode-input-placeholderForeground);
+    }
+    #input::selection {
+      background: var(--vscode-editor-selectionBackground, rgba(128,128,128,0.4));
     }
     .composer-footer {
       container-type: inline-size;
@@ -3401,6 +3444,39 @@ export class ChatViewProvider {
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .file-dropdown {
+      position: absolute;
+      bottom: 100%;
+      left: 0;
+      right: 0;
+      background: var(--vscode-dropdown-background);
+      border: 1px solid var(--vscode-dropdown-border);
+      border-radius: 4px;
+      max-height: 200px;
+      overflow-y: auto;
+      display: none;
+      z-index: 1000;
+      margin-bottom: 4px;
+    }
+    .file-dropdown.show {
+      display: block;
+    }
+    .file-dropdown.hidden {
+      display: none;
+    }
+    .file-item {
+      padding: 6px 10px;
+      cursor: pointer;
+      color: var(--vscode-foreground);
+      font-size: 0.85em;
+    }
+    .file-item:hover {
+      background: var(--vscode-list-hoverBackground);
+    }
+    .file-item.selected {
+      background: var(--vscode-list-activeSelectionBackground);
+      color: var(--vscode-list-activeSelectionForeground);
+    }
     .send-spinner {
       width: 18px;
       height: 18px;
@@ -3572,7 +3648,11 @@ export class ChatViewProvider {
         <div id="accountBalance" class="account-balance hidden" role="status" aria-live="polite"></div>
       </div>
       <div id="attachmentBar" class="attachment-bar"></div>
-      <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — attach, paste, or drop images — Enter to send"></textarea>
+      <div class="input-wrap">
+        <div id="inputHighlight" class="input-highlight" aria-hidden="true"></div>
+        <textarea id="input" rows="3" placeholder="Ask, Plan, or Agent — attach, paste, or drop images — @ for files — Enter to send"></textarea>
+      </div>
+      <div id="fileDropdown" class="file-dropdown hidden"></div>
       <div class="composer-footer">
         <div class="composer-left">
           <div id="modeDropdown"></div>
@@ -3620,8 +3700,16 @@ export class ChatViewProvider {
     const clearBtn = document.getElementById('clearBtn');
     const newSessionBtn = document.getElementById('newSessionBtn');
     const deleteSessionBtn = document.getElementById('deleteSessionBtn');
+    const fileDropdownEl = document.getElementById('fileDropdown');
+    const inputHighlightEl = document.getElementById('inputHighlight');
 
     let processing = false;
+    // @ mention dropdown state
+    let mentionActive = false;
+    let mentionFiles = [];
+    let mentionIndex = -1;
+    let mentionQuery = '';
+    let mentionStartPos = -1;
     let thinkingEl = null;
     // Request-level work clock — one continuous timer from send → final message,
     // so the elapsed time and "working" indicator never disappear mid-request.
@@ -4108,7 +4196,14 @@ export class ChatViewProvider {
 
     function formatContent(text, role) {
       if (!text) return '';
-      if (role === 'user' || role === 'error') {
+      if (role === 'user') {
+        // Render @mentions as inline code so the verified-file-link
+        // pipeline (linkifyFileMentions) can style/link them like assistant messages.
+        return escapeHtml(text).replace(/@(\\S+)/g, function (m, token) {
+          return '<code>' + token + '</code>';
+        });
+      }
+      if (role === 'error') {
         return escapeHtml(text);
       }
       try {
@@ -5395,6 +5490,8 @@ export class ChatViewProvider {
         modelId
       });
       inputEl.value = '';
+      updateInputHighlight();
+      syncInputScroll();
       pendingAttachments = [];
       renderPendingAttachments();
     }
@@ -5402,6 +5499,127 @@ export class ChatViewProvider {
     function stop() {
       if (!processing) return;
       vscode.postMessage({ type: 'stop' });
+    }
+
+    function updateInputHighlight() {
+      if (!inputHighlightEl) return;
+      const text = inputEl.value;
+      const re = /(^|[\\s\\n])@([^\\s\\n]+)/g;
+      let lastIndex = 0;
+      let html = '';
+      let match;
+      while ((match = re.exec(text)) !== null) {
+        const leading = match[1];
+        const mentionStart = match.index + leading.length;
+        const mentionEnd = match.index + match[0].length;
+        html += escapeHtml(text.slice(lastIndex, mentionStart));
+        html += '<span class="mention-chip">' + escapeHtml(text.slice(mentionStart, mentionEnd)) + '</span>';
+        lastIndex = mentionEnd;
+      }
+      html += escapeHtml(text.slice(lastIndex));
+      inputHighlightEl.innerHTML = html;
+    }
+
+    function syncInputScroll() {
+      if (!inputHighlightEl) return;
+      // Textarea vs. div box models differ by a few px even with identical
+      // font/padding, which desyncs a plain scrollTop copy — pin the height too.
+      inputHighlightEl.style.height = inputEl.clientHeight + 'px';
+      inputHighlightEl.scrollTop = inputEl.scrollTop;
+      inputHighlightEl.scrollLeft = inputEl.scrollLeft;
+    }
+
+    // @ mention dropdown functions
+    function closeFileDropdown() {
+      if (!fileDropdownEl) return;
+      mentionActive = false;
+      mentionFiles = [];
+      mentionIndex = -1;
+      fileDropdownEl.classList.remove('show');
+      fileDropdownEl.classList.add('hidden');
+    }
+
+    function showFileDropdown(files) {
+      if (!fileDropdownEl) return;
+      mentionFiles = files;
+      mentionIndex = 0;
+      fileDropdownEl.innerHTML = '';
+
+      if (files.length === 0) {
+        closeFileDropdown();
+        return;
+      }
+
+      files.forEach((file, idx) => {
+        const item = document.createElement('div');
+        item.className = 'file-item' + (idx === 0 ? ' selected' : '');
+        item.textContent = file;
+        item.addEventListener('click', () => {
+          insertFileAtMention(file);
+          closeFileDropdown();
+        });
+        fileDropdownEl.appendChild(item);
+      });
+
+      fileDropdownEl.classList.remove('hidden');
+      fileDropdownEl.classList.add('show');
+    }
+
+    function updateFileSelection() {
+      if (!fileDropdownEl) return;
+      const items = fileDropdownEl.querySelectorAll('.file-item');
+      items.forEach((item, idx) => {
+        item.classList.toggle('selected', idx === mentionIndex);
+      });
+    }
+
+    function insertFileAtMention(file) {
+      const text = inputEl.value;
+      const before = text.substring(0, mentionStartPos);
+      const after = text.substring(mentionStartPos + mentionQuery.length + 1);
+      inputEl.value = before + '@' + file + after;
+      updateInputHighlight();
+      syncInputScroll();
+      inputEl.focus();
+      closeFileDropdown();
+    }
+
+    function handleMentionInput() {
+      const text = inputEl.value;
+      const cursorPos = inputEl.selectionStart;
+
+      // Look backwards from cursor for @
+      let atPos = -1;
+      for (let i = cursorPos - 1; i >= 0; i--) {
+        if (text[i] === '@') {
+          atPos = i;
+          break;
+        }
+        if (/\\s/.test(text[i])) break; // Stop at whitespace
+      }
+
+      if (atPos === -1) {
+        closeFileDropdown();
+        return;
+      }
+
+      const query = text.substring(atPos + 1, cursorPos);
+
+      // Only activate if query doesn't contain spaces or newlines
+      if (/[\\s\\n]/.test(query)) {
+        closeFileDropdown();
+        return;
+      }
+
+      mentionActive = true;
+      mentionQuery = query;
+      mentionStartPos = atPos;
+
+      // Request files from backend
+      vscode.postMessage({
+        type: 'findMentionFiles',
+        query: query
+      });
     }
 
     sendBtn.addEventListener('click', () => {
@@ -5426,6 +5644,29 @@ export class ChatViewProvider {
       vscode.postMessage({ type: 'deleteSession', sessionId: sessionDropdown.getValue() });
     });
     inputEl.addEventListener('keydown', (e) => {
+      if (mentionActive && mentionFiles.length > 0) {
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          mentionIndex = (mentionIndex - 1 + mentionFiles.length) % mentionFiles.length;
+          updateFileSelection();
+          return;
+        } else if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          mentionIndex = (mentionIndex + 1) % mentionFiles.length;
+          updateFileSelection();
+          return;
+        } else if (e.key === 'Enter') {
+          e.preventDefault();
+          insertFileAtMention(mentionFiles[mentionIndex]);
+          closeFileDropdown();
+          return;
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          closeFileDropdown();
+          return;
+        }
+      }
+
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         if (!processing) {
@@ -5433,6 +5674,17 @@ export class ChatViewProvider {
         }
       }
     });
+    inputEl.addEventListener('input', () => {
+      updateInputHighlight();
+      syncInputScroll();
+      handleMentionInput();
+    });
+    inputEl.addEventListener('click', () => {
+      syncInputScroll();
+      handleMentionInput();
+    });
+    inputEl.addEventListener('keyup', syncInputScroll);
+    inputEl.addEventListener('scroll', syncInputScroll);
     inputEl.addEventListener('paste', handlePasteAttachments);
 
     window.addEventListener('message', (event) => {
@@ -5580,9 +5832,16 @@ export class ChatViewProvider {
             !!msg.timedOut
           );
           break;
+        case 'mentionFiles':
+          if (mentionActive) {
+            showFileDropdown(msg.files || []);
+          }
+          break;
       }
     });
 
+    updateInputHighlight();
+    syncInputScroll();
     vscode.postMessage({ type: 'ready' });
   </script>
 </body>

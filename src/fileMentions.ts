@@ -41,6 +41,31 @@ export function stripFileMentions(text: string): string {
   return result;
 }
 
+/** Find workspace files matching a query pattern. */
+export async function findWorkspaceFiles(query: string, maxResults: number = 20): Promise<string[]> {
+  if (!vscode.workspace.workspaceFolders?.length) {
+    return [];
+  }
+
+  try {
+    const pattern = `**/${query}*`;
+    const uris = await vscode.workspace.findFiles(pattern, '**/node_modules/**', maxResults);
+    const paths = uris
+      .map((uri) => {
+        const wsFolder = vscode.workspace.getWorkspaceFolder(uri);
+        if (wsFolder) {
+          return vscode.workspace.asRelativePath(uri, false);
+        }
+        return uri.fsPath;
+      })
+      .sort();
+
+    return paths;
+  } catch {
+    return [];
+  }
+}
+
 /** Read file contents from workspace. */
 export async function readMentionedFiles(paths: string[]): Promise<string> {
   if (!paths.length || !vscode.workspace.workspaceFolders?.length) {

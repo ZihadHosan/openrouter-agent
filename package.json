@@ -2,7 +2,7 @@
   "name": "openrouter-agent",
   "displayName": "OpenRouter Agent — AI Coding Assistant",
   "description": "Free AI coding assistant for VS Code — use Claude, GPT-4, Gemini & 300+ models. Ask, Plan, and Agent modes. No subscription required.",
-  "version": "1.30.0",
+  "version": "1.31.17",
   "publisher": "ZihadHosan",
   "license": "MIT",
   "icon": "media/openrouter-agent-logo/icon-256.png",
